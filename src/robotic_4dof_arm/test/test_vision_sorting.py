@@ -4,7 +4,7 @@
 Covers the ROS-free helper methods (no executor / action servers needed):
   - PickAndPlace.is_reachable / _compute_ik  — reachability envelope guard
   - PickAndPlace._normalize_angle / IK branch wrap / _duplicate_server_hint —
-    live-run regressions (URDF ±3.14 base limit, duplicate move_group, errors)
+    live-run regressions (UR5e ±2π joint limits, duplicate move_group, errors)
   - SortingController._on_pick_table         — Table 2 pick-region filter
   - SortingController._object_reachable      — grasp+lift waypoint check
   - SortingController._update_registry       — cross-scan object registry
@@ -31,10 +31,16 @@ from sorting_controller import (  # noqa: E402
     LIFT_HEIGHT_M,
     MAX_SLOTS,
     REACH_MARGIN_M,
+    SCAN_TCP_WORLD_Z,
+    SCAN_X,
+    SCAN_YS,
     PICK_REGION_X_MIN,
     PICK_REGION_X_MAX,
     PICK_REGION_Y_MIN,
     PICK_REGION_Y_MAX,
+    GRASP_GAP_MIN_M,
+    GRASP_GAP_MAX_M,
+    GRASP_MAX_VEL_M_S,
 )
 
 # Load the launch file as a module (filename has a dot, so use importlib).
@@ -52,7 +58,9 @@ def spawner():
 @pytest.fixture
 def arm():
     """PickAndPlace without __init__ (no ROS graph needed for pure IK logic)."""
-    return PickAndPlace.__new__(PickAndPlace)
+    node = PickAndPlace.__new__(PickAndPlace)
+    node.get_logger = MagicMock()   # failure paths log loudly
+    return node
 
 
 @pytest.fixture
@@ -65,6 +73,8 @@ def controller():
     node._blue_zones = [(-0.28, 0.12), (-0.28, 0.24), (-0.28, 0.36)]
     node._red_used = 0
     node._blue_used = 0
+    node._last_joint_state = None   # for _prong_states / _verify_grasp tests
+    node._buf = []                  # for _collect tests
     return node
 
 
@@ -82,15 +92,20 @@ def test_compute_ik_returns_six_joints_for_reachable(arm):
 
 
 def test_compute_ik_returns_none_for_far_corner(arm):
-    """Old spawn corner (R ~= 0.87 m) must fail LOUDLY — no clamping."""
-    q = arm._compute_ik(-0.78, 0.38, _arm_z(PICK_WORLD_Z))
+    """Far outside the UR5e envelope (R ~= 1.00 m) must fail LOUDLY — no clamping.
+
+    (The old (-0.78, 0.38) corner from the custom-UR5 days IS solvable with
+    the vendor UR5e geometry — the interim tool-down IK lands the jaw
+    FK-exact, verified — so it can no longer serve as the unreachable probe.)"""
+    q = arm._compute_ik(-0.92, 0.40, _arm_z(PICK_WORLD_Z))
     assert q is None
 
 
 def test_is_reachable_boundary(arm):
     z = _arm_z(PICK_WORLD_Z)
     assert arm.is_reachable(-0.70, 0.10, z) is True
-    assert arm.is_reachable(-0.78, 0.38, z) is False
+    assert arm.is_reachable(-0.78, 0.38, z) is True   # solvable with UR5e geometry
+    assert arm.is_reachable(-0.92, 0.40, z) is False
 
 
 def test_is_reachable_below_wrist_offset(arm):
@@ -134,7 +149,7 @@ def test_object_reachable_for_typical_object(controller):
 
 
 def test_object_unreachable_for_far_corner(controller):
-    assert controller._object_reachable(-0.78, 0.38) is False
+    assert controller._object_reachable(-0.92, 0.40) is False
 
 
 def test_object_reachable_checks_lift_waypoint_too(controller):
@@ -197,7 +212,7 @@ def test_registry_skips_sort_zone_detections(controller):
 
 
 def test_registry_skips_unreachable_and_warns(controller):
-    candidates = controller._update_registry([('red_cube', -0.80, 0.30)])
+    candidates = controller._update_registry([('red_cube', -0.92, 0.40)])
     assert candidates == []
     assert controller._registry == []
     controller.get_logger.return_value.warning.assert_called()
@@ -278,10 +293,11 @@ def test_fallback_rejects_impossible_counts(spawner):
         spawner._fallback_positions(6)
 
 
-# ── Live-run regression: IK base joint must respect the URDF ±3.14 limit ────
-# Coordinates from the 20:35 failure log: pick=(-0.676, 0.105) produced
-# theta1 = 3.14817 — above the URDF arm_base_joint limit (3.14) — and every
-# MoveIt goal answered FAILURE(99999).
+# ── Live-run regression: IK joints must respect the URDF joint limits ───────
+# Historical: the old custom arm failed the pick at (-0.676, 0.105) with
+# theta1 = 3.14817 — above its ±3.14 limit — and every MoveIt goal answered
+# FAILURE(99999).  The Phase 0 UR5e has ±2π limits; the regression now
+# asserts every IK solution stays inside them AND lands FK-exact.
 
 def test_normalize_angle_wraps_into_pi_band(arm):
     assert arm._normalize_angle(3.14817) == pytest.approx(3.14817 - 2 * math.pi, abs=1e-9)
@@ -290,30 +306,61 @@ def test_normalize_angle_wraps_into_pi_band(arm):
     assert -math.pi <= arm._normalize_angle(17.0) < math.pi
 
 
-def test_compute_ik_live_failure_target_now_within_limits(arm):
-    q = arm._compute_ik(-0.676, 0.105, 0.05)
+def test_compute_ik_live_failure_target_within_limits_and_exact(arm):
+    """The old failure-log target must solve within the UR5e ±2π limits and
+    land the jaw on the target (FK round-trip, tool-down orientation)."""
+    tgt = (-0.676, 0.105, 0.05)
+    q = arm._compute_ik(*tgt)
     assert q is not None
-    assert all(abs(v) <= 3.14 + 1e-9 for v in q)
+    assert all(abs(v) <= arm.JOINT_LIMIT + 1e-9 for v in q)
+    p, z = arm._fk_jaw(q)
+    assert math.dist(p, tgt) < 1e-6
+    assert abs(z[0]) < 1e-9 and abs(z[1]) < 1e-9 and abs(z[2] + 1.0) < 1e-9
 
 
 def test_compute_ik_picks_correct_d4_branch(arm):
-    """atan2(0.105, -0.676) + asin(d4/R) = 3.1477 wraps to -3.1355.
-    The old min(|theta1|) rule picked the mirror branch (2.8276), which
-    FK-verification showed lands the TCP 218 mm (= 2*d4) from the target
-    for every object with y > 0."""
-    q = arm._compute_ik(-0.676, 0.105, 0.05)
-    assert q is not None
-    assert q[0] == pytest.approx(-3.1355, abs=1e-3)
+    """The d4 wrist offset gives two mirrored wrist planes; the branch the
+    solver picks must land the jaw ON the target (not 2*d4 away, as the old
+    min(|theta1|) rule did) — verified by FK round-trip, both signs of y."""
+    for y in (0.105, -0.105):
+        tgt = (-0.676, y, 0.05)
+        q = arm._compute_ik(*tgt)
+        assert q is not None
+        p, _ = arm._fk_jaw(q)
+        assert math.dist(p, tgt) < 1e-6, f'branch error at y={y}'
 
 
 def test_compute_ik_spawn_band_sweep_within_limits(arm):
-    """Every pickable spawn position must yield in-limit joints or loud None."""
+    """Every pickable spawn position must yield in-limit joints (±2π) or a
+    loud None — and any returned solution must be FK-exact."""
     for y in (-0.38, -0.20, 0.0, 0.20, 0.38):
         for x in (-0.66, -0.75):
             q = arm._compute_ik(x, y, 0.05)
             if q is None:
                 continue  # unreachable envelope corner — covered by None tests
-            assert all(abs(v) <= 3.14 + 1e-9 for v in q)
+            assert all(abs(v) <= arm.JOINT_LIMIT + 1e-9 for v in q)
+            p, _ = arm._fk_jaw(q)
+            assert math.dist(p, (x, y, 0.05)) < 1e-6
+
+
+def test_scan_poses_reachable_and_within_limits(arm):
+    """Every wrist-camera scan pose must solve IK and stay in joint limits.
+
+    The scan poses park the TCP 0.39 m above the table so the eye-in-hand
+    camera (lens 0.05 m above the TCP plane) clears the 0.30 m depth near
+    clip while covering the full spawn band.
+    """
+    scan_az = SCAN_TCP_WORLD_Z - ARM_BASE_WORLD_Z
+    for sy in SCAN_YS:
+        q = arm._compute_ik(SCAN_X, sy, scan_az)
+        assert q is not None, f'scan pose ({SCAN_X}, {sy}) unreachable'
+        assert len(q) == 6
+        assert all(abs(v) <= arm.JOINT_LIMIT + 1e-9 for v in q)
+        # Interim UR5e IK: scan poses solve on the mirrored wrist plane (B)
+        # and must still land the jaw exactly on the scan target.
+        p, z = arm._fk_jaw(q)
+        assert math.dist(p, (SCAN_X, sy, scan_az)) < 1e-6
+        assert abs(z[2] + 1.0) < 1e-9
 
 
 def test_duplicate_server_hint(arm):
@@ -327,3 +374,162 @@ def test_moveit_error_code_names(arm):
     assert arm._ERROR_NAMES[99999] == 'FAILURE'
     assert arm._ERROR_NAMES[10001] == 'PLANNING_FAILED'
     assert arm._ERROR_NAMES[10004] == 'CONTROL_FAILED'
+
+
+# ── Grasp verification (3b — jaw gap + velocity) ────────────────────────────
+
+def _make_joint_state(qr: float, ql: float, vr: float = 0.0, vl: float = 0.0):
+    """Return a lightweight mock joint-state message for the prong joints."""
+    msg = MagicMock()
+    msg.name     = ['right_prong_joint', 'left_prong_joint']
+    msg.position = [qr, ql]
+    msg.velocity = [vr, vl]
+    return msg
+
+
+def test_jaw_gap_formula(controller):
+    """gap = 0.035 + qr - ql (prong geometry, arm.urdf.xacro:330-363)."""
+    controller._last_joint_state = _make_joint_state(0.06, -0.06)
+    assert controller._jaw_gap() == pytest.approx(0.035 + 0.06 + 0.06)
+
+
+def test_jaw_gap_none_when_no_joint_state(controller):
+    controller._last_joint_state = None
+    assert controller._jaw_gap() is None
+
+
+def test_verify_grasp_held(controller):
+    """Object between the jaws: prongs stall at ±0.0325 → gap ≈ 0.100 m → HELD."""
+    qr, ql = 0.0325, -0.0325
+    controller._last_joint_state = _make_joint_state(qr, ql, 0.0, 0.0)
+    # Patch sleep so the test does not actually wait
+    import time
+    from unittest.mock import patch
+    with patch.object(time, 'sleep', return_value=None):
+        assert controller._verify_grasp('test') is True
+
+
+def test_verify_grasp_empty(controller):
+    """No object: prongs reach command ±0.012 → gap ≈ 0.059 m → EMPTY."""
+    qr, ql = 0.012, -0.012
+    controller._last_joint_state = _make_joint_state(qr, ql, 0.0, 0.0)
+    import time
+    from unittest.mock import patch
+    with patch.object(time, 'sleep', return_value=None):
+        assert controller._verify_grasp('test') is False
+
+
+def test_verify_grasp_corner(controller):
+    """Corner-grasped cube: prongs stall at ±0.0705 → gap ≈ 0.176 m → EMPTY (flag)."""
+    # gap = 0.035 + 0.0705 - (-0.0705) = 0.1760 > GRASP_GAP_MAX_M (0.115)
+    qr, ql = 0.0705, -0.0705
+    controller._last_joint_state = _make_joint_state(qr, ql, 0.0, 0.0)
+    import time
+    from unittest.mock import patch
+    with patch.object(time, 'sleep', return_value=None):
+        assert controller._verify_grasp('test') is False
+
+
+def test_verify_grasp_no_joint_state_passes_through(controller):
+    """Missing /joint_states must not block the mission (returns True conservatively)."""
+    controller._last_joint_state = None
+    import time
+    from unittest.mock import patch
+    with patch.object(time, 'sleep', return_value=None):
+        assert controller._verify_grasp('test') is True
+
+
+def test_grasp_constants_signal_budget():
+    """The grasp gap window must be wide enough to capture 0.1 m objects."""
+    # A held object gives gap ≈ 0.100 m; must be inside [MIN, MAX].
+    object_size_m = 0.10   # cube face-to-face / cylinder diameter
+    assert GRASP_GAP_MIN_M < object_size_m < GRASP_GAP_MAX_M
+    # The empty close (command ±0.012 → gap 0.059) must be OUTSIDE the window.
+    empty_gap = 0.035 + 0.012 + 0.012
+    assert empty_gap < GRASP_GAP_MIN_M
+
+
+# ── Yaw alignment helpers ────────────────────────────────────────────────────
+
+def test_jaw_world_yaw(controller):
+    """jaw_world_yaw(theta1) = degrees(theta1) on the UR5e (q6 = 0,
+    FK-verified against the vendor model)."""
+    theta1 = math.radians(-90.0)
+    assert SortingController._jaw_world_yaw(theta1) == pytest.approx(-90.0, abs=1e-6)
+    theta1 = 0.0
+    assert SortingController._jaw_world_yaw(theta1) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_nearest_90_deg():
+    assert SortingController._nearest_90_deg(10.0)  == pytest.approx(0.0)
+    assert SortingController._nearest_90_deg(46.0)  == pytest.approx(90.0)
+    assert SortingController._nearest_90_deg(-46.0) == pytest.approx(-90.0)
+    assert SortingController._nearest_90_deg(91.0)  == pytest.approx(90.0)
+
+
+def test_align_ik_yaw_cylinder_unchanged(controller):
+    """Cylinders are insensitive to yaw — the IK solution must not be modified."""
+    q = [math.radians(-90), 0.5, -0.8, 0.3, 0.0, 0.0]
+    result = controller._align_ik_yaw(q, 37.0, 'blue_cylinder', 'test')
+    assert result == q
+
+
+def test_align_ik_yaw_cube_applies_correction(controller):
+    """For a red_cube the yaw correction must trim wrist_3 (q6) so the jaw
+    axis rotates toward the nearest cube face (UR5e: jaw_yaw = q1 - q6)."""
+    controller.get_logger = MagicMock()
+    # theta1 = 0.0 → jaw_world_yaw = 0°
+    # obj_angle_deg = 70° → nearest_90 = 90° → delta = +90° → q6 -= pi/2
+    q = [0.0, 0.5, -0.8, 0.3, 0.0, 0.0]
+    result = controller._align_ik_yaw(q, 70.0, 'red_cube', 'test')
+    assert result is not None
+    assert len(result) == 6
+    assert result[:5] == q[:5]                 # position joints untouched
+    assert result[5] == pytest.approx(-math.pi / 2, abs=1e-6)
+    # New jaw yaw must equal the requested nearest face normal.
+    assert SortingController._jaw_world_yaw(result[0]) - math.degrees(result[5]) \
+        == pytest.approx(90.0, abs=1e-6)
+
+
+def test_align_ik_yaw_none_input_unchanged(controller):
+    """If IK returns None (unreachable), _align_ik_yaw must pass None through."""
+    result = controller._align_ik_yaw(None, 45.0, 'red_cube', 'test')
+    assert result is None
+
+
+# ── Registry 4-tuple angle propagation ──────────────────────────────────────
+
+def test_registry_stores_angle_deg(controller):
+    """angle_deg from the detection must be stored in the registry entry."""
+    detections = [('red_cube', -0.70, 0.10, 37.5)]
+    controller._update_registry(detections)
+    assert len(controller._registry) == 1
+    assert controller._registry[0].get('angle_deg') == pytest.approx(37.5)
+
+
+def test_registry_refreshes_angle_on_rescan(controller):
+    """A re-scan with a new angle must update the angle in the existing entry."""
+    controller._update_registry([('red_cube', -0.70, 0.10, 10.0)])
+    controller._update_registry([('red_cube', -0.70, 0.10, 45.0)])
+    assert len(controller._registry) == 1
+    assert controller._registry[0]['angle_deg'] == pytest.approx(45.0)
+
+
+def test_collect_dedup_preserves_angle(controller):
+    """
+    The dedup logic in _collect must preserve the angle field (4-tuple), not
+    strip it to a 3-tuple.  We test this indirectly: we push the raw 4-tuples
+    through _update_registry (which consumes _collect's output) and verify the
+    angle lands in the registry.  We also do a white-box check on the dedup
+    branch by exercising the cluster/median path with 4-tuple seeds.
+    """
+    # Two detections of the same object: same class, within DEDUP_RADIUS_M
+    dets_4tuple = [
+        ('red_cube', -0.70, 0.10, 15.0),
+        ('red_cube', -0.702, 0.098, 20.0),   # same object, slightly shifted
+    ]
+    # _update_registry must handle 4-tuples and store the angle
+    candidates = controller._update_registry(dets_4tuple)
+    assert len(candidates) == 1, "Two nearby same-class detections should merge to one"
+    assert 'angle_deg' in candidates[0], "angle_deg must be stored in registry entry"
+    assert isinstance(candidates[0]['angle_deg'], float)

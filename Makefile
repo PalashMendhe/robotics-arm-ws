@@ -3,7 +3,7 @@ SHELL  := /bin/bash
 ROS    := /opt/ros/lyrical/setup.bash
 WS     := $(shell pwd)/install/setup.bash
 
-.PHONY: build sim run test clean docker-build docker-sim docker-run vision-sim vision-sort vision-clean
+.PHONY: build sim run test clean docker-build docker-sim docker-run vision-sim vision-sim-headless vision-sort vision-clean
 
 ## Local (sourced terminal) targets
 build:
@@ -26,6 +26,11 @@ run:
 vision-sim:
 	source $(ROS) && source $(WS) && \
 	ros2 launch robotic_4dof_arm vision_sim.launch.py
+
+## Same stack without the Gazebo GUI (server only) — CI / headless boxes.
+vision-sim-headless:
+	source $(ROS) && source $(WS) && \
+	ros2 launch robotic_4dof_arm vision_sim.launch.py headless:=true
 
 vision-sort:
 	source $(ROS) && source $(WS) && \

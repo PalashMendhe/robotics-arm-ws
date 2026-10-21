@@ -1,0 +1,170 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <world name="inspection_cell">
+
+    <!-- ── Physics & System Plugins ─────────────────────────────────────── -->
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-contact-system"
+            name="gz::sim::systems::Contact"/>
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- ── Lighting ─────────────────────────────────────────────────────── -->
+    <light type="directional" name="ambient_fill">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.25 0.25 0.25 1.0</diffuse>
+      <specular>0.05 0.05 0.05 1</specular>
+      <direction>0.3 -0.2 -1</direction>
+    </light>
+
+    <light type="spot" name="inspection_spot">
+      <pose>0.35 -0.25 1.5 0 0 0</pose>
+      <diffuse>1.0 0.98 0.95 1</diffuse>
+      <specular>0.6 0.6 0.6 1</specular>
+      <direction>0.2 0.25 -0.68</direction>
+      <attenuation>
+        <range>5</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <spot>
+        <inner_angle>0.261799</inner_angle>
+        <outer_angle>0.523599</outer_angle>
+        <falloff>0.5</falloff>
+      </spot>
+    </light>
+
+    <!-- ── Ground Plane ──────────────────────────────────────────────────── -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane><normal>0 0 1</normal></plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>20 20</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Robot Pedestal ───────────────────────────────────────────────── -->
+    <model name="robot_pedestal">
+      <static>true</static>
+      <pose>0 0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.6 0.6 0.8</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.6 0.6 0.8</size></box>
+          </geometry>
+          <material>
+            <ambient>0.25 0.25 0.28 1</ambient>
+            <diffuse>0.25 0.25 0.28 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Inspection Table (granite surface plate) ─────────────────────── -->
+    <model name="inspection_table">
+      <static>true</static>
+      <pose>0.55 0 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.6 0.5 0.1</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.6 0.5 0.1</size></box>
+          </geometry>
+          <material>
+            <ambient>0.45 0.45 0.48 1</ambient>
+            <diffuse>0.45 0.45 0.48 1</diffuse>
+            <specular>0.15 0.15 0.15 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Clamping pins ────────────────────────────────────────────────── -->
+    <model name="clamping_pin_1">
+      <static>true</static>
+      <pose>0.40 0.15 0.82 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.01</radius><length>0.06</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Aerospace test workpiece (PBR metallic) ──────────────────────── -->
+    <model name="aerospace_workpiece">
+      <static>true</static>
+      <pose>0.55 0 0.82 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.12 0.08 0.04</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.12 0.08 0.04</size></box>
+          </geometry>
+          <material>
+            <pbr>
+              <metal>
+                <albedo_map></albedo_map>
+              </metal>
+            </pbr>
+            <ambient>0.8 0.8 0.82 1</ambient>
+            <diffuse>0.8 0.8 0.82 1</diffuse>
+            <specular>0.9 0.9 0.9 1</specular>
+            <metalness>0.92</metalness>
+            <roughness>0.12</roughness>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

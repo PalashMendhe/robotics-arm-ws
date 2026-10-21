@@ -28,6 +28,10 @@
   <exec_depend>moveit_ros_move_group</exec_depend>
   <exec_depend>moveit_kinematics</exec_depend>
 
+  <!-- Official UR5e model (Phase 0 baseline, ur_type:=ur5e) -->
+  <depend>ur_description</depend>
+  <exec_depend>xacro</exec_depend>
+
   <!-- Vision pipeline dependencies -->
   <exec_depend>vision_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>

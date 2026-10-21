@@ -148,12 +148,17 @@
       </link>
     </model>
 
-    <!-- ── D415 Camera (pole-mounted at edge of Table 1) ─────────────────── -->
-    <!-- Position: x=-0.45, y=0.0, z=1.45                                   -->
-    <!-- Orientation: yaw=π (facing -X toward Table 2), pitch=45° down       -->
+    <!-- ── Census camera (parked fallback, NOT bridged) ─────────────────── -->
+    <!-- The primary vision is now the eye-in-hand camera on the wrist
+         (arm.urdf.xacro, d415_wrist_link).  This static overhead camera is
+         parked at the recommended census position (implementation.md §3.3:
+         1.00 m above the table, nadir) and is DISABLED (always_on=false, and
+         its /d415/* topics are no longer bridged in vision_sim.launch.py).
+         To re-enable it as a pure counting cross-check: set always_on=true
+         and add the /d415/* topics back to the parameter_bridge arguments. -->
     <model name="d415_camera">
       <static>true</static>
-      <pose>-0.45 0.0 1.45 0 0.785 3.14159</pose>
+      <pose>-0.90 0.0 2.00 0 1.5708 0</pose>
 
       <link name="d415_camera_link">
         <!-- Camera body visual -->
@@ -210,12 +215,45 @@
               <stddev>0.007</stddev>
             </noise>
           </camera>
-          <always_on>true</always_on>
+          <always_on>false</always_on>
           <update_rate>30</update_rate>
           <visualize>false</visualize>
           <topic>d415</topic>
           <gz_frame_id>d415_camera_link</gz_frame_id>
         </sensor>
+      </link>
+    </model>
+
+    <!-- ── Metallic inspection workpiece (PBR) ─────────────────────────────── -->
+    <model name="workpiece">
+      <static>true</static>
+      <pose>0.5 0 0.85 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.15 0.1 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.7 0.7 0.75 1</ambient>
+            <diffuse>0.7 0.7 0.75 1</diffuse>
+            <specular>0.9 0.9 0.9 1</specular>
+            <pbr>
+              <metal>
+                <metalness>0.9</metalness>
+                <roughness>0.15</roughness>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.15 0.1 0.05</size>
+            </box>
+          </geometry>
+        </collision>
       </link>
     </model>
 

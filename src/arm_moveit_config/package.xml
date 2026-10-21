@@ -16,6 +16,9 @@
   <depend>moveit_ros_planning_interface</depend>
   <depend>robot_state_publisher</depend>
 
+  <!-- Official UR5e model (Phase 0 baseline, ur_type:=ur5e) -->
+  <depend>ur_description</depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

@@ -1,6 +1,28 @@
 robot:
   use_sim_time: true
 
+# Kinematic constants — MUST stay in sync with the vendored ur_description
+# UR5e model instantiated by urdf/arm.urdf.xacro (ur_type:=ur5e).
+# test_params.py::test_kinematics_match_urdf xacro-processes the cell wrapper
+# and asserts the generated URDF joint origins & FK match every value here.
+# If they diverge, the IK (pick_and_place.py) silently picks the wrong spot.
+kinematics:
+  d1: 0.1625          # shoulder height above base    (shoulder_pan_joint z)
+  a2: 0.425           # upper arm length             (elbow_joint |x|)
+  a3: 0.3922          # forearm length               (wrist_1_joint |x|)
+  d4: 0.1333          # wrist_1 lateral offset       (wrist_1_joint z)
+  d5: 0.0997          # wrist_2 offset               (wrist_2_joint |y|)
+  d6: 0.0996          # flange offset along tool axis (wrist_3_joint |y|)
+  jaw_centre_offset: 0.018  # prong mid-plane above gripper_base_link
+  flange_adapter: 0.055     # ISO 9409-1-50-4-M6 adapter: flange -> gripper_base_link
+  # Jaw centre below the flange (tool0): flange_adapter + jaw_centre_offset.
+  flange_to_jaw: 0.073
+  # TCP (jaw-centre) reference used by pick_and_place.is_reachable() /
+  # _compute_ik(): wrist_1 pivot height above the shoulder =
+  #   z_jaw + tcp_grasp_reference - dz_correction.
+  tcp_grasp_reference: 0.1726   # d6 + flange_adapter + jaw_centre_offset
+  dz_correction: 0.1625         # d1 (shoulder height above base)
+
 motion:
   max_velocity_scaling_factor: 0.3
   max_acceleration_scaling_factor: 0.3
@@ -16,25 +38,27 @@ workspace:
   max_corner: [2.0, 2.0, 2.0]
 
 joints:
+  # UR5e joint names & limits — mirrors ur_description/config/ur5e/
+  # joint_limits.yaml (all six joints: ±2π position, 180°/s velocity).
   arm:
-    arm_base_joint:
-      min_position: -3.14
-      max_position: 3.14
-    upper_arm_joint:
-      min_position: -3.14
-      max_position: 3.14
-    forearm_joint:
-      min_position: -3.14
-      max_position: 3.14
-    wrist_joint:
-      min_position: -3.14
-      max_position: 3.14
-    gripper_baseTOwrist_joint:
-      min_position: -3.14
-      max_position: 3.14
-    gripper_base_joint:
-      min_position: -3.14
-      max_position: 3.14
+    shoulder_pan_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
+    shoulder_lift_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
+    elbow_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
+    wrist_1_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
+    wrist_2_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
+    wrist_3_joint:
+      min_position: -6.283185307179586
+      max_position: 6.283185307179586
 
   gripper:
     right_prong_joint:
@@ -44,21 +68,155 @@ joints:
       min_position: -0.08
       max_position: 0.08
 
+  # UR5e standby: elbow-up, tool down, facing the pick table (-X).
+  # FK-verified (test_params.py::test_home_pose_fk_tool_down): jaw centre ≈
+  # (-0.293, -0.133, 0.415) arm-local, tool0 z-axis = (0, 0, -1).
   home_position:
-    arm_base_joint: 0.0
-    upper_arm_joint: 1.57
-    forearm_joint: -1.57
-    wrist_joint: -1.57
-    gripper_baseTOwrist_joint: 0.0
-    gripper_base_joint: 0.0
+    shoulder_pan_joint: 3.141592653589793
+    shoulder_lift_joint: -1.5707963267948966
+    elbow_joint: 1.5707963267948966
+    wrist_1_joint: 1.5707963267948966
+    wrist_2_joint: 1.5707963267948966
+    wrist_3_joint: 0.0
     right_prong_joint: 0.06
     left_prong_joint: -0.06
 
-# Vision mode flag — set to true to subscribe to /vision/detections instead of YAML coords
-vision:
-  use_vision: false
+# Grasp commands (prong joint targets).
+# These are the live-validated values from implementation.md §10.6: the jaws
+# stall at ±0.0325 on a 0.1 m object, so ±0.012 gives a 20.5 mm grasp signal
+# (vs 4.5 mm at ±0.028) and ±0.06 opens a 0.155 m real gap, which clears the
+# 0.141 m diagonal of a 45°-rotated cube.  Read by pick_and_place.py and
+# sorting_controller.py (single source — never re-type these in code).
+grasp:
+  open:  [0.06, -0.06]
+  close: [0.012, -0.012]
 
-# Sort zones for the sorting controller
+# Scripted demo waypoints (world/Gazebo z).  x/y come from perception
+# (vision.use_vision) or, only as an explicit fallback, from scene.target_box.
+# pick_and_place.py converts to arm-local IK z with arm_z = world_z - scene.arm_base_world_z.
+#
+#   pre_pick  = table top + 0.25 m   (clearance above the object)
+#   grasp     = table top + 0.05 m   (object equator of a 0.1 m object)
+#   lift      = table top + 0.35 m
+#   transport = sort_zones.pre_place_height  (1.20)
+#   place     = sort_zones.place_height      (1.05)
+#   retreat   = transport height
+# test_params.py asserts the cross-references to sort_zones stay in sync.
+mission:
+  # Drop pose of the scripted demo (the "destined" marker in world_publisher.py,
+  # world x/y; the z comes from pick_sequence.place_world_z).
+  place_position: [-0.55, -0.25]
+  pick_sequence:
+    pre_pick_world_z:  1.20
+    grasp_world_z:     1.00
+    lift_world_z:      1.30
+    transport_world_z: 1.20
+    place_world_z:     1.05
+    retreat_world_z:   1.20
+
+# World geometry — the collision scene and the demo fallback pose in ONE place.
+# test_params.py parses worlds/vision_sorting.sdf and asserts scene.tables
+# match the world file, so this block can never silently diverge from Gazebo.
+scene:
+  arm_base_world_z: 0.95     # robot spawn height (gazebo world frame)
+  table_top_world_z: 0.95    # work surface (both tables)
+  # Collision boxes sit this far BELOW the real surface.  0.01 (not 0.005) is
+  # deliberate: an attached object resting on the table must clear the collision
+  # box during the first millimetres of the lift, otherwise MoveIt reports a
+  # collision between the carried object and the table.
+  table_top_clearance: 0.01
+
+  # Tool orientation for Cartesian goals: nadir view = rotate 180° about X.
+  # Used by pick_and_place.move_to_pose() instead of a literal quaternion.
+  tool_orientation: [0.0, 0.7071, 0.0, 0.7071]   # x, y, z, w
+
+  tables:                    # gazebo world coords: [x, y, z] box centres
+    - name: table_1
+      size: [1.0, 0.8, 0.95]
+      centre: [0.0, 0.0, 0.475]
+    - name: table_2
+      size: [0.6, 0.8, 0.95]
+      centre: [-0.9, 0.0, 0.475]
+
+  # Divider wall from warehouse.sdf.  vision_sorting.sdf has NO such wall, so
+  # this stays disabled for the vision world (the old code added it anyway and
+  # the phantom box overlapped table_2's pick area).  Set enabled: true when
+  # running the demo inside warehouse.sdf.
+  obstacle:
+    enabled: false
+    name: obstacle
+    size: [0.5, 0.1, 0.65]
+    centre: [-0.63, -0.04, 1.00]
+
+  # Scripted-demo grasp object.  position is ONLY used when /vision/detections
+  # delivers nothing inside vision.detection_timeout_secs (the run logs the
+  # fallback loudly); with vision up the pose comes from the detector.
+  target_box:
+    id: target_box
+    position: [-0.60, 0.20, 1.00]
+    size: [0.10, 0.10, 0.10]
+    colour: [0.9, 0.1, 0.1]
+
+  objects:                   # size = [x, y, z] for boxes / [d, d, length] for cylinders
+    red_cube:
+      shape: box
+      size: [0.10, 0.10, 0.10]
+    blue_cylinder:
+      shape: cylinder
+      size: [0.10, 0.10, 0.10]
+
+# Vision wiring.
+#   use_vision: pick_and_place.py grasps what /vision/detections reports
+#               (nearest vision.prefer_class inside vision.pick_filter) and
+#               falls back to scene.target_box only on a timeout.
+vision:
+  use_vision: true
+  detections_topic: /vision/detections
+  detection_timeout_secs: 6.0
+  collect_secs: 5.0      # seconds the sorter spins per scan snapshot (_collect)
+  cluster_radius_m: 0.05  # detection cluster radius: candidates within this form one pick target
+  # Classes the detector may publish (shape_detector.py class ids)
+  detection_classes: [red_cube, blue_cylinder]
+  # The scripted demo attaches a BOX to the gripper, so it can only grasp cubes.
+  prefer_class: red_cube
+  # In-scan deduplication radius: two detections within this (same class) are
+  # treated as the same object — set wider than cluster_radius_m so the same
+  # object seen across sub-frames does not appear twice.
+  dedup_radius_m: 0.10
+  # Detection filter reused by sorting_controller.py: tighter than the physical
+  # table so edge-clipped / partial detections are not treated as pickable.
+  # Table 2 spans x: -1.20 … -0.60; Table 1 ends at x = -0.50.
+  pick_filter:
+    x_min: -1.00
+    x_max: -0.55
+    y_min: -0.40
+    y_max:  0.40
+
+# Wrist-camera scan poses (TCP world targets), used by sorting_controller.py.
+# The eye-in-hand camera looks straight down the tool axis, so the image
+# footprint is centred under the TCP — parking is all the aiming the scan needs.
+#   TCP world z = scan.tcp_world_z (1.34) → lens 0.39 m above the table →
+#   objects 0.34 m from the lens (outside camera_params.yaml depth.min_m of
+#   0.30; the jaws are culled by that clip); footprint ≈ 0.47 (world y) ×
+#   0.35 (world x) m per pose, so the two scan.ys poses cover ±0.435 in y with
+#   a 0.07 m overlap strip that the registry merges (MATCH_RADIUS_M).
+#   Reach check at the parked pose: D = 0.811 ≤ L1 + L2 = 0.817 ✓.
+# E6: the lens also sits ~5 cm sideways of the tool axis (+X in the flange
+# frame, camera_params.yaml wrist_camera.xyz) and that offset rotates with
+# theta1, so the true nadir point is not exactly (scan.x, scan.ys).  The
+# coverage margin absorbs it (~15 % of the footprint half-width at h ≈ 0.39 m).
+scan:
+  tcp_world_z: 1.34
+  x: -0.63
+  ys: [-0.20, 0.20]
+  settle_secs: 0.5     # let the arm + camera settle before capturing
+
+# MoveIt2 tolerance params (absolute axis / joint constraints in code).
+# test_params.py::test_moveit_tolerances_json_keys asserts these keys exist so
+# a missing entry fails loudly instead of silently using a stale literal.
+moveit:
+  orientation_tolerance: 0.35  # absolute x/y/z axis tolerance on Cartesian goals
+  joint_tolerance: 0.05        # tolerance_above/below applied to every joint constraint
 # Red = arm's RIGHT (-Y), Blue = arm's LEFT (+Y)
 # Objects placed side-by-side, 12cm apart, z=1.05 (10cm above table to avoid clipping)
 # Grid: row1 (x=-0.28): 3 slots, row2 (x=-0.40): 2 slots
@@ -73,3 +231,77 @@ sort_zones:
   blue:  # arm's left side (+Y), 2 slots mirroring red
     - [-0.28,  0.12]
     - [-0.28,  0.24]
+
+# Sorting mission tunables.  These are the values the sorter's module-level
+# constants (MATCH_RADIUS_M, GRASP_GAP_*, GRASP_MAX_VEL_M_S, etc.) are derived
+# from, so the same numbers stay in one place and test_params.py can assert
+# that the URDF-side grasp geometry (Finding B) is consistent with the verifier
+# gap range.
+sorting:
+  # Cross-scan object registry match radius (metres).  Targets farther apart
+  # than this in successive scans are treated as different objects.
+  match_radius_m: 0.07
+  # Grasp verification (idea 3b, implementation.md §4.2): the measured jaw gap
+  # (0.035 + qr - ql) must land in this band for a grasp to count as HELD.
+  grasp_gap_min_m: 0.085   # 0.10 m object minus tolerance / slight rotation
+  grasp_gap_max_m: 0.115   # open-gap ceiling; also catches 0.141 m corner grasps
+  # After closing, both jaw velocities must be below this (m/s) for the jaws to
+  # count as settled.
+  grasp_max_vel_m_s: 0.01
+  # How long to wait after the close command before sampling the jaw state.
+  grasp_settle_secs: 0.4
+  # Vertical clearance added above the grasp z for pre-pick / lift legs.
+  lift_height_m: 0.10
+  # Number of consecutive empty scans that end the mission.
+  empty_scans_to_finish: 2
+  # Failed pick/place cycles on one object before it is blacklisted.
+  max_attempts_per_object: 2
+  # IK reach envelope margin (metres) used by _object_reachable() to reject
+  # candidates on the edge of the reachable fan.
+  reach_margin_m: 0.02
+  # Consecutive failed cycles → systemic MoveIt failure → abort.
+  consecutive_fail_abort: 3
+  # Settle seconds before capturing after parking at a scan pose.
+  # (dup of scan.settle_secs — kept here so the mission loop can tune it
+  # independently of the scan geometry if the camera warrants it.)
+  scan_settle_secs: 0.5
+
+# Phase 2 — ActiveInspect defect-inspection policy (mcp_server.py /
+# defect_inspector.py read this block; scene_config.py exposes it as
+# INSPECTION so the MCP tools never re-type a threshold).
+# Geometry anchors (survey z, oblique z/tilt, mm-per-pixel scale) come from
+# the camera_params.yaml wrist_camera intrinsics via K^-1 projection.
+inspection:
+  # Multi-view disambiguation geometry (§2.2 item 2):
+  #   nominal survey  = nadir view, TCP 0.45 m above the target plane
+  #   oblique active  = 0.12 m standoff, tool tilted 35° off nadir
+  survey_height_m: 0.45
+  oblique_distance_m: 0.12
+  oblique_tilt_deg: 35.0
+  # Bounded autonomy (§2.2 item 4): at most this many exploratory oblique
+  # viewpoints per candidate before the agent must stop and decide/escalate.
+  max_viewpoints: 3
+  # Confidence policy (§2.2 item 4):
+  #   p >= certify_threshold        → verdict stands, certificate issued
+  #   triage_low < p < certify_threshold → Human-on-the-Loop triage
+  #   p <= triage_low               → benign verdict, no escalation
+  certify_threshold: 0.85
+  triage_low: 0.70
+  # Geometric profiling tunables (§2.2 item 1): adaptive-Gaussian threshold
+  # block size / constant, bilateral filter sigmas, crack-vs-stain aspect
+  # ratio cut, and the K^-1 mm projection tolerance band.
+  adaptive_block_size: 51
+  adaptive_c: 7.0
+  bilateral_d: 7
+  bilateral_sigma_color: 50.0
+  bilateral_sigma_space: 7.0
+  crack_aspect_min: 4.0
+  # A candidate whose spine length is below this is dust/speckle, not a defect.
+  min_spine_length_mm: 1.0
+  # Anchored-shadow test (§2.2 item 2): a structural crack's centroid stays
+  # within this radius (mm) between survey and oblique views; glare/stains
+  # shift or vanish beyond it.
+  anchor_radius_mm: 2.0
+  # ASTM-style certificate sink (certify_inspection tool): JSON records land
+  # here when inspection.cert_dir is unset; Phase 3 archives them to S3.
+  cert_dir: /tmp/activeinspect_certs

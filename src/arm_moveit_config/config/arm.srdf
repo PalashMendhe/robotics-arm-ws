@@ -1,4 +1,11 @@
 <?xml version="1.0" ?>
+<!-- Phase 0 rewrite (phased_implementation.md §0.2): the custom arm links are
+     gone — this SRDF describes the vendored ur_description UR5e chain plus the
+     cell's fixed flange gripper.  The ACM was regenerated: every pair below is
+     an adjacent (parent/child) pair from the generated URDF, plus two
+     geometry-proven 'Never' pairs (prongs vs the camera body, which live in
+     disjoint x-ranges).  Non-adjacent arm self-collisions stay ENABLED on
+     purpose so MoveIt still catches folding collisions. -->
 <robot name="arm">
   <group name="arm">
     <chain base_link="world" tip_link="gripper_tcp"/>
@@ -9,15 +16,18 @@
     <joint name="left_prong_joint"/>
   </group>
 
-  <end_effector name="gripper" parent_link="gripper_base_link" group="gripper" parent_group="arm"/>
+  <!-- Gripper hangs off the UR5e flange (fixed ISO 9409-1-50-4-M6 adapter). -->
+  <end_effector name="gripper" parent_link="flange" group="gripper" parent_group="arm"/>
 
+  <!-- UR5e standby: elbow-up, tool down, facing the pick table (-X).
+       Must match robot_params.yaml joints.home_position. -->
   <group_state name="home" group="arm">
-    <joint name="arm_base_joint" value="0"/>
-    <joint name="upper_arm_joint" value="1.57"/>
-    <joint name="forearm_joint" value="-1.57"/>
-    <joint name="wrist_joint" value="-1.57"/>
-    <joint name="gripper_baseTOwrist_joint" value="0"/>
-    <joint name="gripper_base_joint" value="0"/>
+    <joint name="shoulder_pan_joint" value="3.141592653589793"/>
+    <joint name="shoulder_lift_joint" value="-1.5707963267948966"/>
+    <joint name="elbow_joint" value="1.5707963267948966"/>
+    <joint name="wrist_1_joint" value="1.5707963267948966"/>
+    <joint name="wrist_2_joint" value="1.5707963267948966"/>
+    <joint name="wrist_3_joint" value="0.0"/>
   </group_state>
 
   <group_state name="open" group="gripper">
@@ -30,107 +40,26 @@
     <joint name="left_prong_joint" value="-0.012"/>
   </group_state>
 
-  <!-- Complete Allowed Collision Matrix (ACM) -->
-  <disable_collisions link1="world" link2="arm_base_link" reason="Adjacent"/>
-  <disable_collisions link1="world" link2="base_upper_link" reason="Never"/>
-
-  <disable_collisions link1="arm_base_link" link2="upper_arm_link" reason="Adjacent"/>
-  <disable_collisions link1="arm_base_link" link2="base_upper_link" reason="Adjacent"/>
-  <disable_collisions link1="arm_base_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="forearm_link" reason="Never"/>
-
-  <disable_collisions link1="base_upper_link" link2="upper_arm_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="forearm_link" reason="Never"/>
-
+  <!-- Allowed Collision Matrix: adjacent pairs (generated URDF) -->
+  <disable_collisions link1="world" link2="base_link" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="base_link_inertia" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="base" reason="Adjacent"/>
+  <disable_collisions link1="base_link_inertia" link2="shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="shoulder_link" link2="upper_arm_link" reason="Adjacent"/>
   <disable_collisions link1="upper_arm_link" link2="forearm_link" reason="Adjacent"/>
-  <disable_collisions link1="upper_arm_link" link2="upper_forearm_link" reason="Adjacent"/>
-  <disable_collisions link1="upper_arm_link" link2="forearm_wrist_link" reason="Never"/>
-  <disable_collisions link1="upper_arm_link" link2="wrist_link" reason="Never"/>
-  <disable_collisions link1="upper_arm_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="upper_arm_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="upper_arm_link" link2="gripper_base_link" reason="Never"/>
-
-  <disable_collisions link1="upper_forearm_link" link2="forearm_link" reason="Never"/>
-  <disable_collisions link1="upper_forearm_link" link2="forearm_wrist_link" reason="Never"/>
-  <disable_collisions link1="upper_forearm_link" link2="wrist_link" reason="Never"/>
-
-  <disable_collisions link1="forearm_link" link2="wrist_link" reason="Adjacent"/>
-  <disable_collisions link1="forearm_link" link2="forearm_wrist_link" reason="Adjacent"/>
-  <disable_collisions link1="forearm_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="gripper_tcp" reason="Never"/>
-
-  <disable_collisions link1="forearm_wrist_link" link2="wrist_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="gripper_tcp" reason="Never"/>
-
-  <disable_collisions link1="wrist_link" link2="gripper_baseTOwrist_link" reason="Adjacent"/>
-  <disable_collisions link1="wrist_link" link2="wrist_gripper_link" reason="Adjacent"/>
-  <disable_collisions link1="wrist_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="wrist_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="wrist_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="wrist_link" link2="gripper_tcp" reason="Never"/>
-
-  <disable_collisions link1="wrist_gripper_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="wrist_gripper_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="wrist_gripper_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="wrist_gripper_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="wrist_gripper_link" link2="gripper_tcp" reason="Never"/>
-
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="gripper_base_link" reason="Adjacent"/>
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="gripper_tcp" reason="Never"/>
-
+  <disable_collisions link1="forearm_link" link2="wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_1_link" link2="wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_2_link" link2="wrist_3_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_3_link" link2="ft_frame" reason="Adjacent"/>
+  <disable_collisions link1="wrist_3_link" link2="flange" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="tool0" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="gripper_base_link" reason="Adjacent"/>
   <disable_collisions link1="gripper_base_link" link2="right_prong_link" reason="Adjacent"/>
   <disable_collisions link1="gripper_base_link" link2="left_prong_link" reason="Adjacent"/>
   <disable_collisions link1="gripper_base_link" link2="gripper_tcp" reason="Adjacent"/>
+  <disable_collisions link1="gripper_base_link" link2="d415_wrist_link" reason="Adjacent"/>
 
-  <disable_collisions link1="right_prong_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="right_prong_link" link2="gripper_tcp" reason="Never"/>
-  <disable_collisions link1="left_prong_link" link2="gripper_tcp" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="forearm_wrist_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="gripper_tcp" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="arm_base_link" link2="wrist_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="forearm_wrist_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="gripper_baseTOwrist_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="gripper_base_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="gripper_tcp" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="left_prong_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="right_prong_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="base_upper_link" link2="wrist_link" reason="Never"/>
-  <disable_collisions link1="forearm_link" link2="world" reason="Never"/>
-  <disable_collisions link1="forearm_wrist_link" link2="world" reason="Never"/>
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="gripper_baseTOwrist_link" link2="world" reason="Never"/>
-  <disable_collisions link1="gripper_base_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="gripper_base_link" link2="world" reason="Never"/>
-  <disable_collisions link1="gripper_tcp" link2="upper_arm_link" reason="Never"/>
-  <disable_collisions link1="gripper_tcp" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="gripper_tcp" link2="world" reason="Never"/>
-  <disable_collisions link1="left_prong_link" link2="upper_arm_link" reason="Never"/>
-  <disable_collisions link1="left_prong_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="left_prong_link" link2="world" reason="Never"/>
-  <disable_collisions link1="right_prong_link" link2="upper_arm_link" reason="Never"/>
-  <disable_collisions link1="right_prong_link" link2="upper_forearm_link" reason="Never"/>
-  <disable_collisions link1="right_prong_link" link2="world" reason="Never"/>
-  <disable_collisions link1="upper_arm_link" link2="world" reason="Never"/>
-  <disable_collisions link1="upper_forearm_link" link2="world" reason="Never"/>
-  <disable_collisions link1="upper_forearm_link" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="world" link2="wrist_gripper_link" reason="Never"/>
-  <disable_collisions link1="world" link2="wrist_link" reason="Never"/>
+  <!-- Geometry-proven never-colliding pairs (disjoint x-ranges) -->
+  <disable_collisions link1="right_prong_link" link2="d415_wrist_link" reason="Never"/>
+  <disable_collisions link1="left_prong_link" link2="d415_wrist_link" reason="Never"/>
 </robot>

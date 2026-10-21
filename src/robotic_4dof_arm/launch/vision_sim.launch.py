@@ -21,17 +21,22 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import ExecuteProcess, TimerAction, OpaqueFunction
-from launch.substitutions import PathJoinSubstitution
+from launch.actions import (
+    DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, TimerAction,
+)
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 
 
 # ── Object spawn zone (Table 2 surface, INSIDE the arm's reach envelope) ────
 # Table 2 spans x: -0.60 to -1.20, y: -0.40 to +0.40
 #
-# REACH CONSTRAINT: the analytical IK (_compute_ik) requires
-#   sqrt(dr² + dz²) ≤ L1 + L2 = 0.817 m with dz = z + 0.15.
-# At grasp height (world z = 1.00 → arm z = 0.05) that gives a maximum
-# base radius of R ≈ 0.80 m; use 0.78 m to keep a 2 cm planning margin.
+# REACH CONSTRAINT: the interim UR5e IK (_compute_ik) requires the
+#   wrist_1 pivot to sit within L1 + L2 = 0.8172 m of the shoulder, with the
+#   pivot at dz = z + tcp_grasp_reference - dz_correction = z + 0.0451
+#   (robot_params.yaml kinematics block).  At grasp height (world z = 1.00
+#   → arm z = 0.05) that gives a maximum base radius of R ≈ 0.81 m; use
+#   0.78 m to keep a 3 cm planning margin.
 # The spawn band is therefore x ∈ [-0.63, -sqrt(R² - y²)] — objects that
 # used to spawn near the far corner (e.g. -0.78, ±0.38 → R = 0.87 m) were
 # unreachable and made the arm drive to a clamped, fully-stretched pose.
@@ -224,7 +229,16 @@ def generate_launch_description():
     joint_limits_yaml = os.path.join(pkg_moveit, 'config', 'joint_limits.yaml')
     controllers_yaml = os.path.join(pkg_robot, 'config', 'controllers.yaml')
 
+    # NOTE: arm.urdf.xacro contains a literal `$(find robotic_4dof_arm)` inside
+    # the gz_ros2_control <parameters> tag. That substitution is NOT expanded
+    # by xacro.process_file() at launch-generation time, so replace it here
+    # with the real share-dir path before any Node consumes robot_description.
+    # (This is what previously collapsed the arm: no controller params loaded.)
     robot_description = xacro.process_file(urdf_path).toxml()
+    if '$(find robotic_4dof_arm)' in robot_description:
+        robot_description = robot_description.replace(
+            '$(find robotic_4dof_arm)', pkg_robot
+        )
     robot_description_semantic = open(srdf_path).read()
 
     with open(kinematics_yaml, 'r') as f:
@@ -242,17 +256,43 @@ def generate_launch_description():
         'ompl': ompl_config,
     }
 
-    world_file = PathJoinSubstitution([pkg_robot, 'worlds', 'vision_sorting.sdf'])
+    world_file = PathJoinSubstitution([pkg_robot, 'worlds', 'inspection_cell.sdf'])
 
+    # ── Launch arguments ──────────────────────────────────────────────────
+    # headless:=true runs the Gazebo server only (no GUI) — used by CI and by
+    # `make vision-sim-headless`.  Default keeps the GUI.
+    declare_headless = DeclareLaunchArgument(
+        'headless', default_value='false',
+        description='Run the Gazebo server only (no GUI)'
+    )
+    # ── 1. Gazebo with vision_sorting world (server-only when headless) ──
+    def _gz_process(context):
+        """`gz sim -r [-s] <world>`: -s (server only) when headless:=true."""
+        flags = ['-s'] if context.launch_configurations.get(
+            'headless', 'false').lower() == 'true' else []
+        return [ExecuteProcess(
+            cmd=['gz', 'sim', '-r'] + flags + [world_file],
+            output='screen'
+        )]
+
+    # ── Module-global strings (robot_description, …) are evaluated at
+    # generation time above, including the $(find ...) → absolute-path
+    # rewrite, before any Node below is constructed.
     return LaunchDescription([
 
-        # ── 1. Gazebo with vision_sorting world ───────────────────────────
-        ExecuteProcess(
-            cmd=['gz', 'sim', '-r', world_file],
-            output='screen'
-        ),
+        declare_headless,
+
+        OpaqueFunction(function=_gz_process),
+
+        # NOTE: `$(find robotic_4dof_arm)` inside the URDF's gz_ros2_control
+        # <parameters> tag was already replaced with the absolute share-dir
+        # path at generation time above. Without that, the Gazebo plugin
+        # loads zero controllers and the arm collapses under gravity
+        # (folded/fallen pose in the GUI).
 
         # ── 2. Robot State Publisher ──────────────────────────────────────
+        # (NOTE: the description below — also used by create/move_group —
+        # carries the absolute controllers.yaml path from the patch above.)
         Node(
             package='robot_state_publisher',
             executable='robot_state_publisher',
@@ -262,6 +302,36 @@ def generate_launch_description():
             }]
         ),
 
+        # ── 2b. Startup pose: drive the arm to HOME so it stands upright ──────
+        # The UR5e spawns directly at the UR5e home pose (initial_positions in
+        # arm.urdf.xacro), and the controllers activate ~7 s after spawn.
+        # Publish HOME once over ROS anyway (ros2, NOT gz topic — gz transport
+        # never reaches the ROS controller) so the PID keeps the arm standing
+        # upright facing the pickup table (−X) for the whole mission.
+        ExecuteProcess(
+            cmd=[
+                'bash', '-c',
+                'sleep 16; '
+                'source /opt/ros/lyrical/setup.bash; '
+                'source /home/plsh/robotic_arm/install/setup.bash; '
+'ros2 topic pub --once /arm_controller/joint_trajectory '
+                'trajectory_msgs/msg/JointTrajectory '
+                '"{joint_names: [shoulder_pan_joint, '
+                'shoulder_lift_joint, elbow_joint, '
+                'wrist_1_joint, wrist_2_joint, wrist_3_joint], '
+                'points: [{positions: [3.14159, -1.5708, 1.5708, '
+                '1.5708, 1.5708, 0.0], '
+                'time_from_start: {sec: 3}}]}\"; '
+                'sleep 4; '
+                'ros2 topic pub --once /gripper_controller/joint_trajectory '
+                'trajectory_msgs/msg/JointTrajectory '
+                '\"{joint_names: [right_prong_joint, left_prong_joint], '
+                'points: [{positions: [0.06, -0.06], '
+                'time_from_start: {sec: 1}}]}\"',
+            ],
+            output='screen',
+        ),
+
         # ── 3. Spawn arm in Gazebo ────────────────────────────────────────
         Node(
             package='ros_gz_sim',
@@ -269,7 +339,7 @@ def generate_launch_description():
             arguments=[
                 '-name', 'arm',
                 '-topic', 'robot_description',
-                '-x', '0.0', '-y', '0.0', '-z', '0.95',
+                '-x', '0.0', '-y', '0.0', '-z', '0.8',
             ],
             output='screen'
         ),
@@ -279,16 +349,22 @@ def generate_launch_description():
             package='ros_gz_bridge',
             executable='parameter_bridge',
             arguments=[
-                # Clock
-                '/clock@rosgraph_msgs/msg/Clock@gz.msgs.Clock',
+                # Clock — gz sim publishes simulation time on the
+                # per-world topic /world/<world>/clock; the bare /clock gz
+                # topic carries NO messages, so bridging it left ROS
+                # /clock silent and every use_sim_time node (including
+                # robot_state_publisher and camera_tf_broadcaster) with a
+                # frozen clock and timerless /tf.  Bridged + remapped below.
+                '/world/vision_sorting/clock@rosgraph_msgs/msg/Clock@gz.msgs.Clock',
                 # Joint states (Gazebo → ROS)
                 '/world/vision_sorting/model/arm/joint_state'
                 '@sensor_msgs/msg/JointState@gz.msgs.Model',
-                # D415 camera topics (Gazebo → ROS)
-                '/d415/image@sensor_msgs/msg/Image@gz.msgs.Image',
-                '/d415/depth_image@sensor_msgs/msg/Image@gz.msgs.Image',
-                '/d415/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo',
-                '/d415/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked',
+                # Eye-in-hand (wrist) D415 camera topics (Gazebo → ROS) —
+                # the primary vision source (sensor lives in arm.urdf.xacro)
+                '/d415_wrist/image@sensor_msgs/msg/Image@gz.msgs.Image',
+                '/d415_wrist/depth_image@sensor_msgs/msg/Image@gz.msgs.Image',
+                '/d415_wrist/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo',
+                '/d415_wrist/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked',
                 # Jaw contact sensors (Gazebo -> ROS, idea 3a)
                 '/world/vision_sorting/model/arm/link/right_prong_link/sensor/right_prong_contact/contact'
                 '@ros_gz_interfaces/msg/Contacts@gz.msgs.Contacts',
@@ -296,6 +372,10 @@ def generate_launch_description():
                 '@ros_gz_interfaces/msg/Contacts@gz.msgs.Contacts',
             ],
             remappings=[
+                (
+                    '/world/vision_sorting/clock',
+                    '/clock'
+                ),
                 (
                     '/world/vision_sorting/model/arm/joint_state',
                     '/joint_states'
@@ -324,7 +404,21 @@ def generate_launch_description():
             ]
         ),
 
-        # ── 6. Controllers ────────────────────────────────────────────────
+        # ── 6. Shape detector (wrist camera → /vision/detections) ─────────
+        # Never started before (§1.5) — the sorting mission had no detections
+        # to consume.  Started after the bridge so /d415_wrist/* already exist.
+        TimerAction(
+            period=4.0,
+            actions=[
+                Node(
+                    package='robotic_4dof_arm',
+                    executable='shape_detector.py',
+                    output='screen',
+                ),
+            ]
+        ),
+
+        # ── 7. Controllers ────────────────────────────────────────────────
         TimerAction(
             period=5.0,
             actions=[

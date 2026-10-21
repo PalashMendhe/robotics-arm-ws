@@ -22,14 +22,16 @@ def generate_launch_description():
             parameters=[{'robot_description': robot_description}]
         ),
         # Joint State Publisher GUI
+        # ── Joint State Publisher GUI ──
         Node(
             package='joint_state_publisher_gui',
             executable='joint_state_publisher_gui',
             parameters=[{
                 'zeros': {
-                    'upper_arm_joint': 1.57,
-                    'forearm_joint': -1.57,
-                    'wrist_joint': -1.57
+                    'shoulder_lift_joint': -1.5708,
+                    'elbow_joint': 1.5708,
+                    'wrist_1_joint': 1.5708,
+                    'wrist_2_joint': 1.5708
                 }
             }]
         ),

@@ -1,32 +1,35 @@
+# UR5e velocity limits: 180 deg/s = 3.1416 rad/s on all six joints
+# (ur_description/config/ur5e/joint_limits.yaml).  Position limits come from
+# the URDF (+-2 pi) and are NOT repeated here.
 joint_limits:
-  arm_base_joint:
+  shoulder_pan_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
-  upper_arm_joint:
+  shoulder_lift_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
-  forearm_joint:
+  elbow_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
-  wrist_joint:
+  wrist_1_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
-  gripper_baseTOwrist_joint:
+  wrist_2_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
-  gripper_base_joint:
+  wrist_3_joint:
     has_velocity_limits: true
-    max_velocity: 3.14
+    max_velocity: 3.1416
     has_acceleration_limits: true
     max_acceleration: 1.5
   right_prong_joint:

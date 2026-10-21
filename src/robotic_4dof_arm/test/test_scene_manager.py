@@ -2,7 +2,7 @@
 import sys
 import os
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Point Python at the scripts folder BEFORE importing from it
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
@@ -12,16 +12,24 @@ from planning_scene_manager import PlanningSceneManager  # noqa: E402
 
 @pytest.fixture
 def manager():
-    """Creates a PlanningSceneManager with a fully mocked ROS node."""
+    """Creates a PlanningSceneManager with a fully mocked ROS node.
+
+    No ament patch is needed any more: scene_config resolves robot_params.yaml
+    (ament share first, repo copy as the fallback), so the manager no longer
+    looks the share directory up itself.
+    """
     mock_node = MagicMock()
     mock_node.get_clock.return_value.now.return_value.to_msg.return_value = MagicMock()
 
-    # Patch get_package_share_directory so it finds our local config
-    pkg_path = os.path.join(os.path.dirname(__file__), '..', '..', 'arm_moveit_config')
-    with patch('planning_scene_manager.get_package_share_directory', return_value=pkg_path):
-
-        mgr = PlanningSceneManager(node=mock_node)
+    mgr = PlanningSceneManager(node=mock_node)
     return mgr
+
+
+def test_params_come_from_scene_config(manager):
+    """The manager must read geometry from robot_params.yaml, not literals."""
+    import scene_config as _scene
+    assert manager.params is _scene.PARAMS
+    assert manager.params['scene']['tables'] == _scene.SCENE['tables']
 
 
 def test_add_box_publishes(manager):

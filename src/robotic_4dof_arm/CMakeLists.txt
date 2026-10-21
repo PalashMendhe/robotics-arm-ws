@@ -21,6 +21,14 @@ install(PROGRAMS
   scripts/camera_tf_broadcaster.py
   scripts/shape_detector.py
   scripts/sorting_controller.py
+  scripts/defect_inspector.py
+  scripts/mcp_server.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+# scene_config.py is imported at runtime by pick_and_place / sorting_controller /
+# planning_scene_manager (it resolves robot_params.yaml); install it next to them.
+install(FILES
+  scripts/scene_config.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Testing
@@ -33,6 +41,12 @@ if(BUILD_TESTING)
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
   ament_add_pytest_test(test_vision_sorting test/test_vision_sorting.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
+  ament_add_pytest_test(test_shape_detector test/test_shape_detector.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
+  ament_add_pytest_test(test_cloud_cool test/test_cloud_cool.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
 endif()

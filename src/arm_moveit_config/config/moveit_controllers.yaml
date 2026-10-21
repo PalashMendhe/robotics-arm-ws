@@ -9,12 +9,12 @@ moveit_simple_controller_manager:
     action_ns: follow_joint_trajectory
     default: true
     joints:
-      - arm_base_joint
-      - upper_arm_joint
-      - forearm_joint
-      - wrist_joint
-      - gripper_baseTOwrist_joint
-      - gripper_base_joint
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
 
   gripper_controller:
     type: FollowJointTrajectory

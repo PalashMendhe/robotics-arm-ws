@@ -14,12 +14,12 @@ controller_manager:
 arm_controller:
   ros__parameters:
     joints:
-      - arm_base_joint
-      - upper_arm_joint
-      - forearm_joint
-      - wrist_joint
-      - gripper_baseTOwrist_joint
-      - gripper_base_joint
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
     command_interfaces:
       - position
     state_interfaces:

@@ -21,7 +21,6 @@ from moveit_msgs.msg import (
     BoundingVolume,
 )
 import yaml
-from ament_index_python.packages import get_package_share_directory
 
 # Ensure script directory is in path so we can import PlanningSceneManager
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -29,11 +28,44 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 from planning_scene_manager import PlanningSceneManager
+import scene_config as _scene
 
 
 class PickAndPlace(Node):
+    # ── IK geometry & grasp commands: single source is robot_params.yaml ──────
+    # Exposed by scene_config (which resolves the YAML via ament, with a
+    # repo-relative fallback).  test_params.py asserts these match the
+    # generated UR5e URDF (xacro-processed, FK-verified) and the grasp block,
+    # so they can never drift silently.
+    D1_SHOULDER  = float(_scene.KINEMATICS['d1'])   # shoulder height above base
+    L1_LENGTH    = float(_scene.KINEMATICS['a2'])   # upper arm length (|a2|)
+    L2_LENGTH    = float(_scene.KINEMATICS['a3'])   # forearm length   (|a3|)
+    D4_OFFSET    = float(_scene.KINEMATICS['d4'])   # wrist_1 lateral offset
+    D5_OFFSET    = float(_scene.KINEMATICS['d5'])   # wrist_2 in-plane offset
+    D6_OFFSET    = float(_scene.KINEMATICS['d6'])   # flange offset along tool
+    # Flange (tool0) → jaw centre along the tool axis: ISO adapter + jaw.
+    FLANGE_TO_JAW = float(_scene.KINEMATICS['flange_to_jaw'])
+    # Wrist_1 pivot height above the shoulder =
+    #   z_jaw + TCP_Z_OFFSET - DZ_CORRECTION.
+    TCP_Z_OFFSET = float(_scene.KINEMATICS['tcp_grasp_reference'])
+    DZ_CORRECTION = float(_scene.KINEMATICS['dz_correction'])
+    # Tightest arm-joint position limit from joints.arm.* (UR5e ±2π).
+    JOINT_LIMIT      = _scene.JOINT_LIMIT
+
+    # ── UR5e structural transforms (ur_description, ur_type:=ur5e) ───────────
+    # Fixed rpy values from the vendor URDF chain base_link → tool0; the scalar
+    # offsets above come from robot_params.yaml.  test_params.py::
+    # test_kinematics_match_urdf processes the cell xacro and asserts this FK
+    # matches the generated URDF to < 1e-9 m.
+    _RPY_BASE_INERTIA = (0.0, 0.0, math.pi)                # base_link → inertia
+    _RPY_UPPER_ARM    = (math.pi / 2, 0.0, 0.0)            # → upper_arm_link
+    _RPY_WRIST_2      = (math.pi / 2, 0.0, 0.0)            # → wrist_2_link
+    _RPY_WRIST_3      = (math.pi / 2, math.pi, math.pi)    # → wrist_3_link
+    _RPY_FLANGE       = (0.0, -math.pi / 2, -math.pi / 2)  # wrist_3 → flange
+    _RPY_TOOL0        = (math.pi / 2, 0.0, math.pi / 2)    # flange → tool0
+
     def __init__(self):
-        params_path = os.path.join(get_package_share_directory('arm_moveit_config'), 'config', 'robot_params.yaml')
+        params_path = _scene.load_path()
         with open(params_path, 'r') as f:
             self.params = yaml.safe_load(f)
         super().__init__(
@@ -63,95 +95,346 @@ class PickAndPlace(Node):
         # 3. Initialize PlanningSceneManager
         self.scene = PlanningSceneManager(node=self)
 
+        # 4. Vision: the scripted demo takes the grasp pose from
+        #    /vision/detections when vision.use_vision is true, and only falls
+        #    back to the configured scene.target_box pose when nothing arrives
+        #    (the fallback is logged loudly at pick time, never silent).
+        self._vision = dict(_scene.VISION)
+        self._detections = []
+        self._detection_sub = None
+        if self._vision.get('use_vision', False):
+            try:
+                from vision_msgs.msg import Detection2DArray
+                self._detection_sub = self.create_subscription(
+                    Detection2DArray,
+                    self._vision['detections_topic'],
+                    self._detection_cb,
+                    10,
+                )
+                self.get_logger().info(
+                    f'Vision enabled — subscribing to '
+                    f'{self._vision["detections_topic"]} '
+                    f'(prefer_class={self._vision["prefer_class"]})'
+                )
+            except Exception as exc:      # vision_msgs missing → fallback pose
+                self.get_logger().warning(
+                    f'vision.use_vision is true but {type(exc).__name__}: {exc} '
+                    f'— falling back to scene.target_box'
+                )
+                self._vision['use_vision'] = False
+
         self.get_logger().info('Waiting for MoveGroup and Gripper action servers...')
-        self._move_group_client.wait_for_server()
-        self._gripper_client.wait_for_server()
+        if not self._move_group_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('MoveGroup action server not available')
+        if not self._gripper_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('Gripper action server not available')
         self.get_logger().info('Action servers connected successfully!')
 
-    # Analytical IK geometry constants for this arm
-    D4_OFFSET        = 0.109   # wrist lateral offset (d4)
-    L1_LENGTH        = 0.425   # upper arm length
-    L2_LENGTH        = 0.392   # forearm length
-    TCP_Z_OFFSET     = 0.113   # jaw span centre: d5 (0.095) + 0.018 (prong mid-plane)
-    # Position limit of every arm joint (URDF arm.urdf.xacro: lower/upper ±3.14).
-    JOINT_LIMIT      = 3.14
+    # ── Vision input (pick_and_place demo) ───────────────────────────────────
+    def _detection_cb(self, msg):
+        """Cache the latest detections published by shape_detector.py.
+
+        Only classes listed in vision.detection_classes and inside
+        vision.pick_filter are kept, so objects already placed in the sort
+        zones (Table 1) are never re-picked.
+        """
+        allowed = set(self._vision.get('detection_classes', []))
+        for det in msg.detections:
+            if not det.results:
+                continue
+            cls = det.results[0].hypothesis.class_id
+            if cls not in allowed:
+                continue
+            pos = det.results[0].pose.pose.position
+            if not _scene.in_pick_filter(pos.x, pos.y):
+                continue
+            self._detections.append({
+                'cls': cls,
+                'x': float(pos.x),
+                'y': float(pos.y),
+                'z': float(pos.z),
+            })
+
+    def _pick_target(self):
+        """(x, y, class, source) for the next grasp.
+
+        Vision first: spin until /vision/detections delivers a candidate of
+        vision.prefer_class inside the pick filter (nearest first), then take
+        the mean of the samples.  Only when nothing arrives within
+        vision.detection_timeout_secs does the configured scene.target_box
+        pose get used — and that fallback is logged, never silent.
+        """
+        box = _scene.SCENE['target_box']
+        fallback = (
+            float(box['position'][0]), float(box['position'][1]), box['id'],
+            'scene.target_box (vision fallback)',
+        )
+        if not self._vision.get('use_vision', False) or self._detection_sub is None:
+            self.get_logger().warning(
+                f'vision.use_vision is false — using the configured pose '
+                f'({fallback[0]:.2f}, {fallback[1]:.2f})'
+            )
+            return fallback
+
+        prefer = self._vision.get('prefer_class')
+        timeout = float(self._vision.get('detection_timeout_secs', 6.0))
+        self._detections.clear()
+        self.get_logger().info(
+            f'Waiting up to {timeout:.1f} s for /vision/detections '
+            f'({prefer} inside the pick filter)...'
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if any(d['cls'] == prefer for d in self._detections):
+                break
+
+        candidates = [d for d in self._detections if d['cls'] == prefer]
+        if not candidates:
+            self.get_logger().warning(
+                f'No {prefer} detection within {timeout:.1f} s — FALLING BACK to '
+                f'the configured pose ({fallback[0]:.2f}, {fallback[1]:.2f}). '
+                f'This is NOT a perceived object.'
+            )
+            return fallback
+
+        candidates.sort(key=lambda d: math.hypot(d['x'], d['y']))
+        best = candidates[0]
+        cluster = [d for d in candidates
+                   if math.hypot(d['x'] - best['x'], d['y'] - best['y']) < _scene.CLUSTER_RADIUS_M]
+        x = sum(d['x'] for d in cluster) / len(cluster)
+        y = sum(d['y'] for d in cluster) / len(cluster)
+        self.get_logger().info(
+            f'Pick target from vision: {best["cls"]} at ({x:.3f}, {y:.3f}) '
+            f'[{len(cluster)} samples of {len(candidates)} candidate(s)]'
+        )
+        return (x, y, best['cls'], 'vision')
 
     @staticmethod
     def _normalize_angle(a: float) -> float:
         """Wrap an angle into [-pi, pi)."""
         return (a + math.pi) % (2.0 * math.pi) - math.pi
 
+    # ── UR5e forward kinematics (compact, from robot_params.yaml scalars) ─────
+    @classmethod
+    def _fk_jaw(cls, q):
+        """FK base_link → tool0 for the six arm joints, plus the fixed gripper.
+
+        Returns (jaw_position_xyz, tool_z_axis); the jaw centre sits
+        FLANGE_TO_JAW below the flange along the tool axis.  Pure python — no
+        URDF needed at runtime; parity with the vendor model is enforced by
+        test_params.py::test_kinematics_match_urdf.
+        """
+        def T(xyz, rpy):
+            cr, sr = math.cos(rpy[0]), math.sin(rpy[0])
+            cp, sp = math.cos(rpy[1]), math.sin(rpy[1])
+            cy, sy = math.cos(rpy[2]), math.sin(rpy[2])
+            return [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, xyz[0]],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, xyz[1]],
+                [-sp, cp * sr, cp * cr, xyz[2]],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+
+        def mul(A, B):
+            return [[sum(A[i][k] * B[k][j] for k in range(4)) for j in range(4)]
+                    for i in range(4)]
+
+        def rotz(a):
+            c, s = math.cos(a), math.sin(a)
+            return [[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+
+        M = T((0.0, 0.0, 0.0), cls._RPY_BASE_INERTIA)
+        M = mul(M, T((0.0, 0.0, cls.D1_SHOULDER), (0.0, 0.0, 0.0)))
+        M = mul(M, rotz(q[0]))
+        M = mul(M, T((0.0, 0.0, 0.0), cls._RPY_UPPER_ARM))
+        M = mul(M, rotz(q[1]))
+        M = mul(M, T((-cls.L1_LENGTH, 0.0, 0.0), (0.0, 0.0, 0.0)))
+        M = mul(M, rotz(q[2]))
+        M = mul(M, T((-cls.L2_LENGTH, 0.0, cls.D4_OFFSET), (0.0, 0.0, 0.0)))
+        M = mul(M, rotz(q[3]))
+        M = mul(M, T((0.0, -cls.D5_OFFSET, 0.0), cls._RPY_WRIST_2))
+        M = mul(M, rotz(q[4]))
+        M = mul(M, T((0.0, cls.D6_OFFSET, 0.0), cls._RPY_WRIST_3))
+        M = mul(M, T((0.0, 0.0, 0.0), cls._RPY_FLANGE))
+        M = mul(M, T((0.0, 0.0, 0.0), cls._RPY_TOOL0))
+        z = (M[0][2], M[1][2], M[2][2])
+        jaw = (M[0][3] + z[0] * cls.FLANGE_TO_JAW,
+               M[1][3] + z[1] * cls.FLANGE_TO_JAW,
+               M[2][3] + z[2] * cls.FLANGE_TO_JAW)
+        return jaw, z
+
     def is_reachable(self, x: float, y: float, z: float, margin: float = 0.0) -> bool:
         """
-        Checks whether TCP position (x, y, z) lies inside the arm's analytical
-        IK envelope. `margin` (metres) shrinks the usable reach so targets are
-        solvable with the arm not fully stretched.
+        Checks whether TCP position (x, y, z) lies inside the interim UR5e IK
+        envelope (either wrist plane). `margin` (metres) shrinks the usable
+        reach so targets are solvable with the arm not fully stretched.
         """
         R = math.sqrt(x**2 + y**2)
-        if R < self.D4_OFFSET:
+        if R <= self.D4_OFFSET:
             return False  # wrist offset makes asin(d4/R) undefined
-        r_planar = math.sqrt(R**2 - self.D4_OFFSET**2)
-        dz = z + self.TCP_Z_OFFSET - 0.02
-        D = math.sqrt(r_planar**2 + dz**2)
-        max_reach = self.L1_LENGTH + self.L2_LENGTH - margin
-        return abs(self.L1_LENGTH - self.L2_LENGTH) <= D <= max_reach
+        dz = z + self.TCP_Z_OFFSET - self.DZ_CORRECTION
+        reach = self.L1_LENGTH + self.L2_LENGTH - margin
+        inner = abs(self.L1_LENGTH - self.L2_LENGTH)
+        r_sqrt = math.sqrt(R**2 - self.D4_OFFSET**2)
+        for rho in (r_sqrt + self.D5_OFFSET, -r_sqrt + self.D5_OFFSET):
+            if inner <= math.sqrt(rho**2 + dz**2) <= reach:
+                return True
+        return False
+
+    def _planar_seed(self, x: float, y: float, z: float, branch: str) -> list | None:
+        """Planar (q1, q2, q3) seed for the tool-down IK (elbow-up).
+
+        Branch A: wrist plane on the near side (rho = +sqrt(R²-d4²) + d5),
+        Branch B: mirrored plane (rho = -sqrt(R²-d4²) + d5).  Joint conventions
+        are FK-pinned: phi2 = -q2, phi3 = -q3 (see phased_implementation.md §0).
+        """
+        R = math.sqrt(x**2 + y**2)
+        if R <= self.D4_OFFSET:
+            return None
+        a0 = math.atan2(y, x)
+        alpha = math.asin(min(1.0, self.D4_OFFSET / R))
+        r_sqrt = math.sqrt(R**2 - self.D4_OFFSET**2)
+        if branch == 'A':
+            t1 = a0 - alpha
+            rho = r_sqrt + self.D5_OFFSET
+        else:
+            t1 = a0 - math.pi + alpha
+            rho = -r_sqrt + self.D5_OFFSET
+        dz = z + self.TCP_Z_OFFSET - self.DZ_CORRECTION  # wrist_1 above shoulder
+        D = math.sqrt(rho**2 + dz**2)
+        if D > self.L1_LENGTH + self.L2_LENGTH or \
+                D < abs(self.L1_LENGTH - self.L2_LENGTH):
+            return None
+        cos_phi3 = ((D**2 - self.L1_LENGTH**2 - self.L2_LENGTH**2)
+                    / (2.0 * self.L1_LENGTH * self.L2_LENGTH))
+        phi3 = -math.acos(max(-1.0, min(1.0, cos_phi3)))   # elbow-up
+        phi2 = math.atan2(dz, rho) - math.atan2(
+            self.L2_LENGTH * math.sin(phi3),
+            self.L1_LENGTH + self.L2_LENGTH * math.cos(phi3))
+        return [t1, -phi2, -phi3]
+
+    def _newton_tool_down(self, x: float, y: float, z: float,
+                          seed: list) -> list | None:
+        """3-DOF Newton polish on the exact tool-down manifold.
+
+        Tool-down poses are exactly {(q1, q2, q3): q4 = pi/2 - (q2 + q3),
+        q5 = pi/2, q6 = 0} (FK-verified), so the jaw position map is 3→3 and
+        converges to machine precision from the planar seed.
+        """
+        import numpy as np
+
+        def full(q3d):
+            q4 = self._normalize_angle(math.pi / 2.0 - float(q3d[1])
+                                       - float(q3d[2]))
+            return [float(q3d[0]), float(q3d[1]), float(q3d[2]), q4,
+                    math.pi / 2.0, 0.0]
+
+        q3d = np.array(seed, float)
+        h, tol, iters = 1e-7, 1e-9, 15
+        for _ in range(iters):
+            p, _ = self._fk_jaw(full(q3d))
+            if math.dist(p, (x, y, z)) < tol:
+                break
+            J = np.zeros((3, 3))
+            for i in range(3):
+                dq = np.zeros(3)
+                dq[i] = h
+                pp, _ = self._fk_jaw(full(q3d + dq))
+                pm, _ = self._fk_jaw(full(q3d - dq))
+                J[:, i] = [(pp[k] - pm[k]) / (2.0 * h) for k in range(3)]
+            e = np.array([x - p[0], y - p[1], z - p[2]])
+            try:
+                step = np.linalg.solve(J, e)
+            except np.linalg.LinAlgError:
+                step = np.linalg.lstsq(J, e, rcond=None)[0]
+            norm = float(np.linalg.norm(step))
+            if norm > 0.5:
+                step *= 0.5 / norm
+            q3d = q3d + step
+            q3d[1:] = np.clip(q3d[1:], -2.0 * math.pi, 2.0 * math.pi)
+            q3d[0] = float(self._normalize_angle(q3d[0]))
+        q = full(q3d)
+        p, za = self._fk_jaw(q)
+        if math.dist(p, (x, y, z)) > 1e-6 or abs(za[0]) > 1e-9 \
+                or abs(za[1]) > 1e-9 or abs(za[2] + 1.0) > 1e-9:
+            return None
+        # Wrap into (-pi, pi]: equivalent poses, shorter MoveIt joint paths.
+        return [self._normalize_angle(v) for v in q]
+
+    def _ik_branches(self, x: float, y: float, z: float) -> list:
+        """Return all FK-exact tool-down IK solutions (8 max) for the target."""
+        R = math.hypot(x, y)
+        if R <= self.D4_OFFSET:
+            return []
+        a0 = math.atan2(y, x)
+        alpha = math.asin(min(1.0, self.D4_OFFSET / R))
+        r_sqrt = math.sqrt(R * R - self.D4_OFFSET * self.D4_OFFSET)
+        dz = z + self.TCP_Z_OFFSET - self.DZ_CORRECTION
+        L1, L2 = self.L1_LENGTH, self.L2_LENGTH
+        # Base (shoulder) angle solutions: plane A / B.
+        plane_defs = (
+            (a0 - alpha, 1.0),    # A:  t1, base rho = +r_sqrt
+            (a0 - math.pi + alpha, -1.0),  # B: t1, base rho = -r_sqrt
+        )
+        out = []
+        for t1, base_sign in plane_defs:
+            for flip in (1, -1):
+                rho = base_sign * r_sqrt + flip * self.D5_OFFSET
+                D = math.hypot(rho, dz)
+                if D > L1 + L2 or D < abs(L1 - L2):
+                    continue
+                cos_phi3 = ((D * D - L1 * L1 - L2 * L2)
+                            / (2.0 * L1 * L2))
+                cos_phi3 = max(-1.0, min(1.0, cos_phi3))
+                acos_phi3 = math.acos(cos_phi3)
+                for phi3 in (acos_phi3, -acos_phi3):
+                    phi2 = math.atan2(dz, rho) - math.atan2(
+                        L2 * math.sin(phi3), L1 + L2 * math.cos(phi3))
+                    q1 = self._normalize_angle(t1)
+                    q2 = self._normalize_angle(-phi2)
+                    q3 = self._normalize_angle(-phi3)
+                    q4 = self._normalize_angle(
+                        flip * (math.pi / 2.0) - q2 - q3)
+                    q5 = flip * (math.pi / 2.0)
+                    q = [q1, q2, q3, q4, q5, 0.0]
+                    p, za = self._fk_jaw(q)
+                    if math.dist(p, (x, y, z)) > 1e-6:
+                        continue
+                    if abs(za[0]) > 1e-9 or abs(za[1]) > 1e-9 \
+                            or abs(za[2] + 1.0) > 1e-9:
+                        continue
+                    out.append([float(v) for v in q])
+        return out
 
     def _compute_ik(self, x: float, y: float, z: float) -> list | None:
         """
-        Analytical IK for this arm's specific geometry.
-        Returns [theta1..theta6] joint angles for a given TCP (x, y, z),
-        or None when the target is outside the reachable envelope.
-
-        IMPORTANT: unreachable targets are reported as None — silently
-        clamping acos/asin would drive the arm to a bogus fully-stretched
-        pose instead of the requested point.
+        Closed-form UR5e IK (8 branches): analytical 2-link planar solve for
+        (q1, q2, q3) on both wrist planes (A/B) and both elbow signs, times
+        both wrist (q5) flips for the tool-down orientation.  Returns the first
+        solution that is FK-exact and inside the UR5e joint limits, or None.
         """
-        if not self.is_reachable(x, y, z):
-            return None
-        R = math.sqrt(x**2 + y**2)
-        r_planar = math.sqrt(R**2 - self.D4_OFFSET**2)
-        dr = r_planar
-        dz = z + self.TCP_Z_OFFSET - 0.02
-        D = math.sqrt(dr**2 + dz**2)
-        beta = math.atan2(dz, dr)
-        cos_gamma = (self.L1_LENGTH**2 + D**2 - self.L2_LENGTH**2) / (2 * self.L1_LENGTH * D)
-        gamma = math.acos(max(-1.0, min(1.0, cos_gamma)))
-        theta2 = self._normalize_angle(math.pi - (beta + gamma))
-        cos_theta3 = (D**2 - self.L1_LENGTH**2 - self.L2_LENGTH**2) / (2 * self.L1_LENGTH * self.L2_LENGTH)
-        theta3 = self._normalize_angle(math.acos(max(-1.0, min(1.0, cos_theta3))))
-        theta4 = self._normalize_angle(theta2 + theta3 + math.pi / 2.0)
-
-        # Base joint: the d4 wrist offset gives two mirrored IK branches
-        # (theta1 = a0 +- asin(d4/R)).  Raw solutions near the -x axis can
-        # exceed the URDF +-3.14 limit (e.g. 3.1482 for the pick at
-        # (-0.676, 0.105)) — MoveIt then refuses the goal.  Evaluate both
-        # branches, wrap into [-pi, pi), and take the valid one with the
-        # smaller base swing.
-        a0 = math.atan2(y, x)
-        offset = math.asin(self.D4_OFFSET / R)
-        theta1 = None
-        # The d4 wrist offset is on the +Y side of the tool plane: the
-        # correct branch is a0 + offset (verified by FK over 21 targets).
-        # min(|theta1|) picks the mirror branch for every target with y > 0,
-        # landing the TCP 2*d4 = 218 mm from the object.
-        for raw in (a0 + offset, a0 - offset):
-            candidate = self._normalize_angle(raw)
-            if abs(candidate) <= self.JOINT_LIMIT and theta1 is None:
-                theta1 = candidate
-        if theta1 is None:
+        branches = self._ik_branches(x, y, z)
+        in_limit = [q for q in branches
+                    if all(abs(v) <= self.JOINT_LIMIT + 1e-9 for v in q)]
+        if in_limit:
+            return in_limit[0]
+        if branches:
             self.get_logger().warning(
-                f'IK ({x:.3f}, {y:.3f}, {z:.3f}): no base branch inside the '
-                f'+-{self.JOINT_LIMIT:.2f} rad joint limit'
+                f'IK ({x:.3f}, {y:.3f}, {z:.3f}): solution exceeds joint limits'
             )
-            return None
-        for jname, angle in (('theta2', theta2), ('theta3', theta3), ('theta4', theta4)):
-            if abs(angle) > self.JOINT_LIMIT:
-                self.get_logger().warning(
-                    f'IK ({x:.3f}, {y:.3f}, {z:.3f}): {jname}={angle:.4f} exceeds '
-                    f'the +-{self.JOINT_LIMIT:.2f} rad joint limit'
-                )
-                return None
-        return [theta1, theta2, theta3, theta4, 0.0, 0.0]
+            return branches[0]
+        if math.hypot(x, y) <= self.D4_OFFSET:
+            self.get_logger().warning(
+                f'IK ({x:.3f}, {y:.3f}, {z:.3f}): target inside wrist offset'
+            )
+        else:
+            self.get_logger().warning(
+                f'IK ({x:.3f}, {y:.3f}, {z:.3f}): no tool-down solution in '
+                'either wrist plane'
+            )
+        return None
 
     def _ik_or_abort(self, x: float, y: float, z: float, step: str) -> list:
         """
@@ -225,11 +508,15 @@ class PickAndPlace(Node):
             )
         return False
 
-    def move_to_pose(self, x: float, y: float, z: float, qx: float = 0.0, qy: float = 0.7071, qz: float = 0.0, qw: float = 0.7071, link_name: str = 'gripper_tcp') -> bool:
+    def move_to_pose(self, x: float, y: float, z: float, orientation: tuple = None, link_name: str = 'gripper_tcp') -> bool:
         """
         Plans and executes a collision-free path to the target Cartesian pose using MoveIt 2.
         Validates workspace bounds before sending. Retries on failure.
+
+        orientation: (x, y, z, w) quaternion; defaults to the configured
+        scene.tool_orientation (nadir / pointing down) — no literal quaternion.
         """
+        qx, qy, qz, qw = orientation or _scene.TOOL_ORIENTATION
         if not self._is_within_workspace(x, y, z):
             self.get_logger().error(
                 f'Target ({x:.2f}, {y:.2f}, {z:.2f}) is OUTSIDE workspace bounds. Refusing goal.'
@@ -294,9 +581,9 @@ class PickAndPlace(Node):
         ocm.header.stamp = self.get_clock().now().to_msg()
         ocm.link_name = link_name
         ocm.orientation = target_pose.orientation
-        ocm.absolute_x_axis_tolerance = 0.35
-        ocm.absolute_y_axis_tolerance = 0.35
-        ocm.absolute_z_axis_tolerance = 0.35
+        ocm.absolute_x_axis_tolerance = _scene.ORIENT_TOLERANCE
+        ocm.absolute_y_axis_tolerance = _scene.ORIENT_TOLERANCE
+        ocm.absolute_z_axis_tolerance = _scene.ORIENT_TOLERANCE
         ocm.weight = 1.0
 
         constraints = Constraints()
@@ -334,8 +621,8 @@ class PickAndPlace(Node):
             jc = JointConstraint()
             jc.joint_name = name
             jc.position = float(pos)
-            jc.tolerance_above = 0.05
-            jc.tolerance_below = 0.05
+            jc.tolerance_above = _scene.JOINT_TOLERANCE
+            jc.tolerance_below = _scene.JOINT_TOLERANCE
             jc.weight = 1.0
             constraints.joint_constraints.append(jc)
 
@@ -457,9 +744,14 @@ class PickAndPlace(Node):
 
         home = list(self.params['joints']['home_position'].values())
 
-        # 1. Initialize MoveIt Planning Scene (Table, Obstacle Divider, Target Box)
-        self.get_logger().info('\n[1/11] Initializing Planning Scene Obstacles...')
-        self.scene.init_full_scene()
+        # ── Waypoints: robot_params.yaml mission.pick_sequence, converted to
+        #    arm-local IK z once (arm_z = world_z - scene.arm_base_world_z).
+        seq = {name: _scene.arm_z(world_z)
+               for name, world_z in _scene.PICK_SEQUENCE.items()}
+
+        # 1. Initialize MoveIt Planning Scene (tables + pick object) from YAML
+        self.get_logger().info('\n[1/11] Initializing Planning Scene from robot_params.yaml...')
+        self.scene.init_scene_from_params()
         time.sleep(1.0)
 
         # 2. Return to Home pose (upright safe stance)
@@ -467,50 +759,89 @@ class PickAndPlace(Node):
         if not self.move_to_joints(home):
             self._abort('Step 2: Home Pose')
 
-        # 3. Open Gripper
+        # 3. Open Gripper (grasp.open from robot_params.yaml)
         self.get_logger().info('\n[3/11] Opening Gripper...')
-        self.move_gripper([0.04, -0.04])
+        self.move_gripper(_scene.GRIPPER_OPEN)
 
-        # 4. Move to Pre-Pick Pose (15 cm above box at x=-0.60, y=0.20)
-        self.get_logger().info('\n[4/11] Planning path to Pre-Pick Pose (above box)...')
-        if not self.move_to_joints(self._ik_or_abort(-0.60, 0.20, 0.25, 'Step 4: Pre-Pick Pose')):
+        # 4. Perception decides the grasp pose — no pose is baked into this
+        #    script any more.  _pick_target() asks /vision/detections for the
+        #    nearest object inside the pick filter and only uses the configured
+        #    fallback pose (logging it) when vision delivers nothing.
+        pick_x, pick_y, obj_cls, obj_source = self._pick_target()
+        obj_size = _scene.object_size(obj_cls)
+        obj_id = obj_cls
+        table_top = _scene.TABLE_TOP_WORLD_Z
+        self.get_logger().info(
+            f'Grasp pose source: {obj_source} → {obj_cls} at '
+            f'({pick_x:.3f}, {pick_y:.3f}), size {obj_size}'
+        )
+        # Put the perceived object into the planning scene so the planner sees it
+        self.scene.add_object_from_params(
+            obj_id, obj_cls, (pick_x, pick_y, table_top)
+        )
+
+        # 5. Move to Pre-Pick Pose (waypoint from mission.pick_sequence)
+        self.get_logger().info(
+            f'\n[4/11] Planning path to Pre-Pick Pose '
+            f'({pick_x:.2f}, {pick_y:.2f}, world z={_scene.PICK_SEQUENCE["pre_pick_world_z"]:.2f})...'
+        )
+        if not self.move_to_joints(
+                self._ik_or_abort(pick_x, pick_y, seq['pre_pick_world_z'],
+                                  'Step 4: Pre-Pick Pose')):
             self._abort('Step 4: Pre-Pick Pose')
 
-        # 5. Descend to Grasp Pose (surrounding the target box)
+        # 6. Descend to Grasp Pose (surrounding the perceived object)
         self.get_logger().info('\n[5/11] Descending to Grasp Height...')
-        if not self.move_to_joints(self._ik_or_abort(-0.60, 0.20, 0.05, 'Step 5: Grasp Height')):
+        if not self.move_to_joints(
+                self._ik_or_abort(pick_x, pick_y, seq['grasp_world_z'],
+                                  'Step 5: Grasp Height')):
             self._abort('Step 5: Grasp Height')
 
-        # 6. Close Gripper & Attach Box in MoveIt
-        self.get_logger().info('\n[6/11] Closing Gripper & Attaching Box to MoveIt...')
-        self.move_gripper([0.028, -0.028])
-        self.scene.attach_target_box_to_gripper(link_name='gripper_base_link')
+        # 7. Close Gripper & Attach the object in MoveIt
+        self.get_logger().info('\n[6/11] Closing Gripper & Attaching Object to MoveIt...')
+        self.move_gripper(_scene.GRIPPER_CLOSE)
+        self.scene.attach_object_to_gripper(
+            obj_id, obj_size, link_name='gripper_base_link'
+        )
         time.sleep(0.5)
 
-        # 7. Lift Object (Vertical Retreat)
+        # 8. Lift Object (Vertical Retreat)
         self.get_logger().info('\n[7/11] Lifting Object vertically...')
-        if not self.move_to_joints(self._ik_or_abort(-0.60, 0.20, 0.35, 'Step 7: Lift')):
+        if not self.move_to_joints(
+                self._ik_or_abort(pick_x, pick_y, seq['lift_world_z'],
+                                  'Step 7: Lift')):
             self._abort('Step 7: Lift')
 
-        # 8. Collision-Aware Transport around Obstacle to Destination Marker
-        self.get_logger().info('\n[8/11] Planning Collision-Free Path AROUND Obstacle to Pre-Place...')
-        if not self.move_to_joints(self._ik_or_abort(-0.45, -0.25, 0.30, 'Step 8: Transport')):
+        # 9. Collision-Aware Transport to the drop pose.  The drop pose is the
+        #    first sort-zone slot for the object's class (robot_params.yaml
+        #    sort_zones) — exactly where the vision sorter puts that class.
+        drop_x, drop_y = _scene.place_pose(obj_cls)
+        self.get_logger().info('\n[8/11] Planning Collision-Free Path to Pre-Place...')
+        if not self.move_to_joints(
+                self._ik_or_abort(drop_x, drop_y, seq['transport_world_z'],
+                                  'Step 8: Transport')):
             self._abort('Step 8: Transport')
 
-        # 9. Descend to Place Pose (onto green destination marker)
+        # 10. Descend to Place Pose (onto the destination marker)
         self.get_logger().info('\n[9/11] Lowering to Place Pose...')
-        if not self.move_to_joints(self._ik_or_abort(-0.45, -0.25, 0.10, 'Step 9: Place Height')):
+        if not self.move_to_joints(
+                self._ik_or_abort(drop_x, drop_y, seq['place_world_z'],
+                                  'Step 9: Place Height')):
             self._abort('Step 9: Place Height')
 
-        # 10. Open Gripper & Detach Object in MoveIt
+        # 11. Open Gripper & Detach Object in MoveIt
         self.get_logger().info('\n[10/11] Opening Gripper & Detaching Object...')
-        self.move_gripper([0.04, -0.04])
-        self.scene.detach_target_box_from_gripper(drop_position=(-0.45, -0.25, 0.05))
+        self.move_gripper(_scene.GRIPPER_OPEN)
+        self.scene.detach_object_from_gripper(
+            obj_id, (drop_x, drop_y, table_top), obj_size
+        )
         time.sleep(0.5)
 
-        # 11. Retreat Upwards & Return to Home
+        # 12. Retreat Upwards & Return to Home
         self.get_logger().info('\n[11/11] Retreating Upwards & Returning Home...')
-        if not self.move_to_joints(self._ik_or_abort(-0.45, -0.25, 0.30, 'Step 11: Retreat')):
+        if not self.move_to_joints(
+                self._ik_or_abort(drop_x, drop_y, seq['retreat_world_z'],
+                                  'Step 11: Retreat')):
             self._abort('Step 11: Retreat')
         if not self.move_to_joints(home):
             self._abort('Step 11: Return Home')

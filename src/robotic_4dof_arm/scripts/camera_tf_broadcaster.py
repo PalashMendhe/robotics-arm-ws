@@ -58,15 +58,62 @@ class CameraTfBroadcaster(Node):
             'config', 'camera_params.yaml'
         )
         with open(params_path, 'r') as f:
-            cfg = yaml.safe_load(f)['camera']
+            cfg = yaml.safe_load(f)
 
+        broadcaster = StaticTransformBroadcaster(self)
+
+        oqx, oqy, oqz, oqw = euler_to_quaternion(*LINK_TO_OPTICAL_RPY)
+
+        # ── ROOT: Gazebo world -> URDF world (arm mount) ──────────────────
+        # The URDF root link is named 'world' but lives at the arm spawn
+        # position, 0.95 m above the Gazebo world origin.  Publishing the
+        # offset lets every consumer work in true Gazebo coordinates by
+        # looking up 'world_gazebo' (shape_detector does exactly that).
+        gz_frame = cfg['gazebo_world_frame']
+        ox, oy, oz = cfg['world_offset']
+        tf_root = TransformStamped()
+        tf_root.header.stamp = self.get_clock().now().to_msg()
+        tf_root.header.frame_id = gz_frame
+        tf_root.child_frame_id = 'world'
+        tf_root.transform.translation.x = ox
+        tf_root.transform.translation.y = oy
+        tf_root.transform.translation.z = oz
+        tf_root.transform.rotation.w = 1.0
+        broadcaster.sendTransform(tf_root)
+        self.get_logger().info(
+            f'Published static TF: {gz_frame} -> world at '
+            f'xyz=({ox}, {oy}, {oz}) (arm mount offset)'
+        )
+
+        # ── PRIMARY: wrist (eye-in-hand) camera ────────────────────────────
+        # The mount TF (gripper_base_link -> d415_wrist_link) is published
+        # dynamically by robot_state_publisher from the URDF fixed joint —
+        # this node only adds the static link -> optical-frame rotation.
+        wrist = cfg['wrist_camera']
+        oqx, oqy, oqz, oqw = euler_to_quaternion(*LINK_TO_OPTICAL_RPY)
+        tf_optical = TransformStamped()
+        tf_optical.header.stamp = self.get_clock().now().to_msg()
+        tf_optical.header.frame_id = wrist['frame_id']
+        tf_optical.child_frame_id = wrist['optical_frame_id']
+        tf_optical.transform.rotation.x = oqx
+        tf_optical.transform.rotation.y = oqy
+        tf_optical.transform.rotation.z = oqz
+        tf_optical.transform.rotation.w = oqw
+        broadcaster.sendTransform(tf_optical)
+        self.get_logger().info(
+            f'Published static TF: {wrist["frame_id"]} -> '
+            f'{wrist["optical_frame_id"]} (camera->optical rotation; '
+            f'mount TF comes from robot_state_publisher)'
+        )
+
+        # ── PARKED: static pole camera (census fallback) ───────────────────
+        # Its mount is world-fixed, so the full static chain is correct.
+        cfg = cfg['camera']
         xyz = cfg['xyz']
         rpy = cfg['rpy']
         parent = cfg['parent_frame']
         link = cfg['frame_id']
         child = cfg['optical_frame_id']
-
-        broadcaster = StaticTransformBroadcaster(self)
 
         # ── TF 1: world → camera_link (mechanical mount pose) ─────────────
         qx, qy, qz, qw = euler_to_quaternion(*rpy)
@@ -84,24 +131,19 @@ class CameraTfBroadcaster(Node):
         broadcaster.sendTransform(tf_mount)
 
         # ── TF 2: camera_link → optical frame (standard convention) ───────
-        oqx, oqy, oqz, oqw = euler_to_quaternion(*LINK_TO_OPTICAL_RPY)
-        tf_optical = TransformStamped()
-        tf_optical.header.stamp = self.get_clock().now().to_msg()
-        tf_optical.header.frame_id = link
-        tf_optical.child_frame_id = child
-        tf_optical.transform.rotation.x = oqx
-        tf_optical.transform.rotation.y = oqy
-        tf_optical.transform.rotation.z = oqz
-        tf_optical.transform.rotation.w = oqw
-        broadcaster.sendTransform(tf_optical)
+        tf_optical2 = TransformStamped()
+        tf_optical2.header.stamp = self.get_clock().now().to_msg()
+        tf_optical2.header.frame_id = link
+        tf_optical2.child_frame_id = child
+        tf_optical2.transform.rotation.x = oqx
+        tf_optical2.transform.rotation.y = oqy
+        tf_optical2.transform.rotation.z = oqz
+        tf_optical2.transform.rotation.w = oqw
+        broadcaster.sendTransform(tf_optical2)
 
         self.get_logger().info(
             f'Published static TF chain: {parent} → {link} '
-            f'at xyz={xyz}, rpy={rpy}'
-        )
-        self.get_logger().info(
-            f'Published static TF: {link} → {child} '
-            f'at rpy={LINK_TO_OPTICAL_RPY} (standard camera→optical rotation)'
+            f'at xyz={xyz}, rpy={rpy} (parked census camera)'
         )
 
 

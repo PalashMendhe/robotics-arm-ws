@@ -2,7 +2,7 @@
 """
 ur5_real.launch.py
 ------------------
-Launch file for running the arm on REAL UR5 hardware.
+Launch file for running the arm on REAL UR5e hardware.
 Replaces Gazebo with the Universal Robots ROS 2 driver.
 
 TODO items are marked with # TODO: — fill these in when hardware is available.
@@ -65,8 +65,8 @@ def generate_launch_description():
         # ── Launch Arguments ──────────────────────────────────────────────────
         DeclareLaunchArgument(
             'robot_ip',
-            default_value='192.168.1.100',   # TODO: set your UR5's actual IP
-            description='IP address of the real UR5 robot'
+            default_value='192.168.1.100',   # TODO: set your UR5e's actual IP
+            description='IP address of the real UR5e robot'
         ),
         DeclareLaunchArgument(
             'use_rviz',
@@ -75,8 +75,10 @@ def generate_launch_description():
         ),
 
         # ── UR Robot Driver ───────────────────────────────────────────────────
-        # TODO: Uncomment when ur_robot_driver is installed (sudo apt install ros-humble-ur)
-        #       Also run ur_calibration first and save to ur5_calibration.yaml
+        # TODO: Uncomment when ur_robot_driver is installed
+        #       (sudo apt install ros-<distro>-ur).  Phase 0 baselines the
+        #       model on ur_type 'ur5e' — keep this in sync with the sim.
+        #       Also run ur_calibration first and save to ur5e_calibration.yaml
         #
         # IncludeLaunchDescription(
         #     PythonLaunchDescriptionSource(
@@ -86,7 +88,7 @@ def generate_launch_description():
         #         )
         #     ),
         #     launch_arguments={
-        #         'ur_type':                'ur5',
+        #         'ur_type':                'ur5e',
         #         'robot_ip':               robot_ip,
         #         'kinematics_params_file': calibration_yaml,
         #         'use_fake_hardware':      'false',

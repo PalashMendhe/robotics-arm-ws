@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-lyrical-gz-ros2-control \
     ros-lyrical-ros-gz-sim \
     ros-lyrical-ros-gz-bridge \
+    ros-lyrical-ur-description \
     && rm -rf /var/lib/apt/lists/*
 
 # Create workspace and copy source

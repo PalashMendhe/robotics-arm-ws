@@ -23,3 +23,20 @@ services:
     command: >
       bash -c "sleep 10 &&
                ros2 run robotic_4dof_arm pick_and_place.py"
+
+  # Phase 3 §3.2 — COOL inspection backend (AWS Graviton / linux/arm64).
+  # Edge keeps robot control + video; this serves ROI profiling + S3 ledger.
+  cool:
+    build:
+      context: .
+      dockerfile: Dockerfile.cool
+    image: activeinspect-cool:arm64
+    platform: linux/arm64
+    container_name: activeinspect_cool
+    ports:
+      - "8000:8000"
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - COOL_KLEIDICV=1

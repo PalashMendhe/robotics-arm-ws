@@ -1,39 +1,91 @@
 # Intel RealSense D415 — simulated camera configuration
-# Adjust xyz/rpy to match your physical/SDF mount position
+#
+# PRIMARY: eye-in-hand camera on the wrist (wrist_camera block below).
+#   Its mount TF (gripper_base_link -> d415_wrist_link) is published by
+#   robot_state_publisher from the URDF fixed joint wrist_camera_joint;
+#   camera_tf_broadcaster.py only adds the link -> optical-frame rotation.
+# PARKED: the static pole camera (camera block below) sits in the world at
+#   the census position but is disabled (always_on=false, unbridged).
 #
 # TF PUBLISHED (see camera_tf_broadcaster.py):
-#   1. world → d415_camera_link      from camera.xyz / camera.rpy below
-#      (must match the d415_camera model pose in vision_sorting.sdf)
-#   2. d415_camera_link → d415_color_optical_frame
-#      fixed standard camera→optical rotation rpy = [-90°, 0, -90°]
+#   1. gripper_base_link -> d415_wrist_link   from the URDF (robot_state_publisher)
+#   2. d415_wrist_link -> d415_wrist_optical_frame
+#      fixed standard camera->optical rotation rpy = [-90°, 0, -90°]
 # Both steps are required for correct back-projection in shape_detector.py.
 
+# ── PRIMARY: eye-in-hand camera on the wrist ─────────────────────────────────
+wrist_camera:
+  name: d415_wrist
+  frame_id: d415_wrist_link
+  optical_frame_id: d415_wrist_optical_frame
+  parent_frame: gripper_base_link
+
+  # Mount (gripper_base_link frame) — MUST match the fixed joint
+  # wrist_camera_joint in arm.urdf.xacro:
+  #   50 mm +X (perpendicular to the jaw travel axis Y) and 50 mm behind the
+  #   flange; rpy (0, -90°, 0) points the optical axis down the tool axis so
+  #   every IK-solved pose is a nadir view.
+  # E6: the lens sits ~5 cm sideways of the TOOL AXIS (+X in the flange
+  # frame).  The true nadir point therefore swings with theta1 — the SCAN_X /
+  # SCAN_YS coverage analysis in sorting_controller.py must use the TF-derived
+  # lens pose, not the TCP.  This xyz/rpy block is DOCUMENTATION of the URDF
+  # joint values; nothing reads it at runtime (the mount TF comes from
+  # robot_state_publisher).  Change the joint in arm.urdf.xacro, not here.
+  xyz: [0.05, 0.0, -0.05]
+  rpy: [0.0, -1.5707, 0.0]
+
+  # Topic prefix (after the gz->ROS bridge): /d415_wrist/{image,depth_image,
+  # camera_info,points}
+  topic_prefix: /d415_wrist
+
+# ── World frame convention ───────────────────────────────────────────────────
+# The URDF root link is named 'world', but it sits at the ARM BASE (the robot
+# is spawned at Gazebo (0, 0, 0.95)), so TF 'world' is 0.95 m below the Gazebo
+# world origin.  camera_tf_broadcaster publishes the correcting static TF
+#   world_gazebo -> world  at (0, 0, spawn_z)
+# and shape_detector back-projects into world_gazebo (= true Gazebo world
+# coordinates, matching PICK_WORLD_Z / sort-zone semantics).
+gazebo_world_frame: world_gazebo
+world_offset: [0.0, 0.0, 0.95]
+
+# ── PARKED: static pole camera (census fallback) ─────────────────────────────
+# Kept in sync with the d415_camera model pose in vision_sorting.sdf so the
+# static TF would be correct if this camera is re-enabled.  camera_tf_broadcaster
+# publishes the world -> d415_camera_link -> d415_color_optical_frame chain for
+# it, but nothing subscribes: the primary detector uses the wrist camera.
 camera:
   name: d415
   frame_id: d415_camera_link
   optical_frame_id: d415_color_optical_frame
   parent_frame: world
 
-  # Camera pole position (world frame): at edge of Table 1 facing Table 2
-  # z=1.45 → 50cm above table surface (pole height)
-  xyz: [-0.45, 0.0, 1.45]
+  # Census position (world frame): nadir, 1.00 m above the table surface
+  # (implementation.md §3.3 recommended pose)
+  xyz: [-0.90, 0.0, 2.00]
 
-  # RPY (world frame):
-  #   roll=0, pitch=0.785 rad (45° downward tilt), yaw=3.14159 (facing -X toward Table 2)
-  rpy: [0.0, 0.785, 3.14159]
+  # RPY (world frame): pitch=90° straight down (nadir)
+  rpy: [0.0, 1.5708, 0.0]
 
 
 # D415 intrinsics (640×480 mode)
+# E7: the world SDF uses horizontal_fov = 1.2112 rad (69.4 deg), which at
+# 640 px wide implies fx ≈ 462 — NOT 602.  These values are a fallback for
+# OFFLINE tuning only: the live detector takes intrinsics from the bridged
+# /d415_wrist/camera_info (E1), which always wins over this block.
 intrinsics:
   width: 640
   height: 480
-  fx: 602.0      # focal length x (pixels)
-  fy: 602.0      # focal length y (pixels)
+  fx: 462.0      # ≈ (640/2) / tan(1.2112/2); matches the SDF HFOV
+  fy: 462.0
   cx: 320.0      # principal point x
   cy: 240.0      # principal point y
   depth_scale: 1.0     # Gazebo: float32 metres (real HW = 0.001 for uint16 mm)
 
-# Topic names (after gz_ros_bridge)
+# Topic names
+# E7: the PARKED census camera (/d415/*, always_on=false, unbridged) is the
+# only publisher of these.  The live detector (shape_detector.py) uses the
+# WRIST camera topics /d415_wrist/{image,depth_image,camera_info}, bridged in
+# vision_sim.launch.py (E1) — not the names below.
 topics:
   color_image: /d415/image
   depth_image: /d415/depth_image
@@ -48,11 +100,41 @@ depth:
 # Vision output
 output_topic: /vision/detections
 
-# Detection parameters
+# Detection parameters  (implementation.md §3.2 — colour decides the class)
 detection:
+  # ── Class decision: HSV colour masks, NOT circularity ─────────────────────
+  # The world's colours are unique per class (vision_sim.launch.py _make_*_sdf):
+  #   red_cube      ambient/diffuse 0.9 0.1 0.1  → red   hue wraps → two bands
+  #   blue_cylinder ambient/diffuse 0.1 0.1 0.9  → blue
+  colour:
+    red_low:    [0,   120, 70]     # band 1 (hue 0-10)
+    red_high:   [10,  255, 255]
+    red_low2:   [170, 120, 70]     # band 2 (hue 170-180)
+    red_high2:  [180, 255, 255]
+    blue_low:   [100, 120, 70]
+    blue_high:  [130, 255, 255]
+
+  # ── Region formation ─────────────────────────────────────────────────────
+  morph_open_k:  3      # remove speckle
+  morph_close_k: 5      # close Canny-free colour holes
+                        # (k < (MIN_SEP - object_size)*fx/h ≈ 9 px at h = 1.00 m)
+
+  # ── Adaptive area gate: expected_px = object_size_m * fx / Z ─────────────
+  # Accept area ∈ [area_scale_min, area_scale_max] · expected_px².
+  # This is what lets ONE detector work at 1.00 m (census) and 0.35 m (wrist).
+  object_size_m:   0.10
+  nominal_range_m: 0.35   # wrist scan pose: lens ~0.39 m above the table
+  area_scale_min:  0.4
+  area_scale_max:  4.0
+  min_area_px:     60     # absolute floor; rejects sub-object colour noise
+
+  # ── Silhouette trust ─────────────────────────────────────────────────────
+  border_margin_px:     2     # a border-touching component is never trusted
+  depth_valid_frac_min: 0.3   # fraction of component pixels with valid depth
+
+  # ── Diagnostics only (no longer decide the class) ────────────────────────
   canny_low: 40
   canny_high: 120
-  contour_area_min: 400
-  contour_area_max: 30000
   circularity_threshold: 0.88
+
   depth_scale: 1.0          # Gazebo: float32 metres (NOT 0.001)

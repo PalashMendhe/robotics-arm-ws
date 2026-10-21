@@ -2,7 +2,8 @@
 """
 sorting_controller.py  —  Week 3: Autonomous Vision-Based Sorting
 ------------------------------------------------------------------
-Perception-driven sorting for an UNKNOWN number of objects:
+Perception-driven sorting for the KNOWN 2+2 scene (2 red cubes + 2 blue
+cylinders; MAX_SLOTS = 2 per class — the mission can sort at most 4):
 
   home → [ scan → pick → lift → traverse → place → retreat ] × N → home
 
@@ -68,19 +69,28 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 from pick_and_place import PickAndPlace   # noqa: E402
+import scene_config as _scene              # noqa: E402
 
 
 # ── Coordinate constants ──────────────────────────────────────────────────────
-ARM_BASE_WORLD_Z = 0.95    # arm spawn height in Gazebo world frame
-PICK_WORLD_Z     = 1.00    # all objects on table at this world z (fixed)
+# Single source = robot_params.yaml (via scene_config).  Nothing below re-types
+# a world offset, a grasp command or a pick-region bound: the same YAML block is
+# what planning_scene_manager publishes and what test_params.py cross-checks
+# against the URDF / world SDF.
+ARM_BASE_WORLD_Z = _scene.ARM_BASE_WORLD_Z   # arm spawn height (gazebo world)
+PICK_WORLD_Z     = _scene.PICK_WORLD_Z       # mission.pick_sequence.grasp_world_z
 
 # ── Detection tuning ──────────────────────────────────────────────────────────
-DETECTION_COLLECT_SECS = 5.0   # seconds to collect detections per scan
+DETECTIONS_TOPIC       = _scene.VISION['detections_topic']
+DETECTION_COLLECT_SECS = float(_scene.VISION.get('collect_secs', 5.0))
 DEDUP_RADIUS_M         = 0.10  # in-scan: detections within 10 cm → same object
 MATCH_RADIUS_M         = 0.07  # cross-scan registry match (< MIN_SEP / 2)
-GRIPPER_OPEN           = [0.06, -0.06]   # 0.155 m gap clears a 45-deg-rotated cube (0.141 m)
-GRIPPER_CLOSE          = [0.012, -0.012]  # 20.5 mm grasp signal vs 4.5 mm at +/-0.028
-MAX_SLOTS              = 2     # placement slots per class (sort_zones grid)
+# Grasp commands: robot_params.yaml grasp.open / grasp.close (single source).
+GRIPPER_OPEN           = list(_scene.GRIPPER_OPEN)    # 0.155 m gap clears a 45-deg cube
+GRIPPER_CLOSE          = list(_scene.GRIPPER_CLOSE)   # 20.5 mm grasp signal
+# Placement capacity is a property of the sort_zones grid, never a literal.
+MAX_SLOTS              = min(len(_scene.SORT_ZONES.get('red') or [0]),
+                             len(_scene.SORT_ZONES.get('blue') or [0]))
 
 
 # ── Grasp verification (idea 3b): jaw gap + settled velocity ────────────────
@@ -97,6 +107,33 @@ GRASP_GAP_MAX_M     = 0.115   # open-gap value; also catches 0.141 m corner gras
 GRASP_MAX_VEL_M_S   = 0.01    # jaws must be settled
 GRASP_SETTLE_SECS   = 0.4     # wait after close before sampling
 
+# ── Wrist-camera scan poses (TCP world targets) ──────────────────────────────
+# The eye-in-hand camera looks straight down the tool axis, so the image
+# footprint is centred under the TCP.  Two poses cover the spawn band
+# (x ∈ [-0.78, -0.63], y ∈ [-0.38, +0.38]):
+#   TCP world z = 1.34 → lens 0.39 m above the table → objects 0.34 m from the
+#   lens (outside the 0.30 m near clip; jaws/prongs are culled by the clip);
+#   footprint ≈ 0.47 (world y) × 0.35 (world x) m per pose → y-coverage
+#   ±0.435 with a 0.07 m overlap strip (registry merges via MATCH_RADIUS_M);
+#   x-coverage [-0.806, -0.454] (the extreme far-corner sliver x < -0.806 is
+#   clipped but the object centre still lands in frame, so it is detected).
+# Reach check (is_reachable at the parked pose): D = 0.811 ≤ L1+L2 = 0.817 ✓.
+# E6: the lens is ALSO ~5 cm sideways of the tool axis (+X in the flange
+# frame, camera_params.yaml wrist_camera.xyz) and that offset ROTATES with
+# theta1, so the true nadir point is not exactly (SCAN_X, SCAN_YS).  The
+# margin absorbs it: at h ≈ 0.39 m a 5 cm shift is ~15 % of the half-width.
+# If SCAN_X/YS are ever re-tuned, recompute from the TF-derived LENS pose
+# (gripper_base_link -> d415_wrist_link from robot_state_publisher), never
+# from the TCP alone.
+#
+# Single source = robot_params.yaml `scan:` (via scene_config).  These module
+# names stay so the existing tests and _scan_pass() need no API change.
+_SCAN = _scene.PARAMS['scan']
+SCAN_TCP_WORLD_Z = float(_SCAN['tcp_world_z'])
+SCAN_X           = float(_SCAN['x'])
+SCAN_YS          = [float(v) for v in _SCAN['ys']]
+SCAN_SETTLE_SECS = float(_SCAN['settle_secs'])
+
 # ── Mission loop tuning ───────────────────────────────────────────────────────
 LIFT_HEIGHT_M           = 0.10  # vertical clearance for pre-pick / lift legs
 EMPTY_SCANS_TO_FINISH   = 2     # consecutive empty scans that end the mission
@@ -105,10 +142,15 @@ REACH_MARGIN_M          = 0.02  # IK envelope margin used to filter candidates
 CONSECUTIVE_FAIL_ABORT  = 3     # consecutive failed cycles → systemic MoveIt failure
 
 # ── Pick-region filter (Table 2 only — placed objects live on Table 1) ───────
-PICK_REGION_X_MIN = -1.00      # Table 2 spans x: -1.20 … -0.60
-PICK_REGION_X_MAX = -0.55      # Table 1 ends at x = -0.50
-PICK_REGION_Y_MIN = -0.45
-PICK_REGION_Y_MAX =  0.45
+# Values come from robot_params.yaml vision.pick_filter via scene_config, so the
+# same bounds steer the sorting registry, the scripted demo grasp and the tests.
+# PICK_REGION_* stay as importable names because test_vision_sorting.py imports
+# them (with tight bounds deliberately narrower than the physical Table 2
+# footprint x: -1.20 … -0.60, whose inner edge is x = -0.60; Table 1 ends at x = -0.50).
+PICK_REGION_X_MIN = _scene.PICK_REGION_X_MIN
+PICK_REGION_X_MAX = _scene.PICK_REGION_X_MAX
+PICK_REGION_Y_MIN = _scene.PICK_REGION_Y_MIN
+PICK_REGION_Y_MAX = _scene.PICK_REGION_Y_MAX
 
 
 
@@ -134,7 +176,7 @@ class SortingController(PickAndPlace):
         # ── Detection buffer ─────────────────────────────────────────────
         self._buf: list = []
         self._det_sub = self.create_subscription(
-            Detection2DArray, '/vision/detections', self._detection_cb, 10
+            Detection2DArray, DETECTIONS_TOPIC, self._detection_cb, 10
         )
         from sensor_msgs.msg import JointState
         self._last_joint_state = None
@@ -164,14 +206,20 @@ class SortingController(PickAndPlace):
             cls = hyp.hypothesis.class_id
             x   = hyp.pose.pose.position.x
             y   = hyp.pose.pose.position.y
-            if cls in ('red_cube', 'blue_cylinder'):
-                self._buf.append((cls, x, y))
+            # bbox.center.theta carries the minAreaRect angle (degrees)
+            # published by shape_detector — used for jaw yaw alignment (§5.2).
+            angle_deg = det.bbox.center.theta
+            if self._allowed_class(cls):
+                self._buf.append((cls, x, y, angle_deg))
 
     # ── Snapshot + dedup ──────────────────────────────────────────────────
     def _collect(self) -> list:
         """
         Spin for DETECTION_COLLECT_SECS, then return deduplicated list of
-        (class_id, x, y) using XY-only deduplication (z ignored — fixed).
+        (class_id, x, y, angle_deg) using XY-only deduplication (z ignored).
+
+        angle_deg is the minAreaRect angle from bbox.center.theta — the most
+        recent sample in the cluster is kept so the angle is fresh.
         """
         self.get_logger().info(
             f'Collecting detections for {DETECTION_COLLECT_SECS:.0f} s ...'
@@ -195,26 +243,33 @@ class SortingController(PickAndPlace):
                 else:
                     outliers.append(item)
             remaining = outliers
-            # Representative: median x, y of cluster
+            # Representative: median x, y; latest angle (last in cluster)
             xs = sorted(c[1] for c in cluster)
             ys = sorted(c[2] for c in cluster)
             mid = len(cluster) // 2
-            unique.append((seed[0], xs[mid], ys[mid]))
+            # Angle: use the last sample in the cluster (most recent frame)
+            latest_angle = cluster[-1][3] if len(cluster[0]) > 3 else 0.0
+            unique.append((seed[0], xs[mid], ys[mid], latest_angle))
 
         return unique
 
     # ── Pick-region + reachability filters ────────────────────────────────
     def _on_pick_table(self, x: float, y: float) -> bool:
-        """True when (x, y) is inside the Table 2 pick region.
+        """True when (x, y) is inside the Table 2 pick filter.
 
-        This excludes anything the camera sees outside Table 2 — in
-        particular objects already placed in the Table 1 sort zones — so
-        placed objects are never re-picked during a re-scan.
+        Delegates to scene_config.in_pick_filter (robot_params.yaml
+        vision.pick_filter) so the sorting registry, the scripted demo and the
+        unit tests all share one definition.  This excludes anything the camera
+        sees outside Table 2 — in particular objects already placed in the
+        Table 1 sort zones — so placed objects are never re-picked.
         """
-        return (
-            PICK_REGION_X_MIN <= x <= PICK_REGION_X_MAX and
-            PICK_REGION_Y_MIN <= y <= PICK_REGION_Y_MAX
-        )
+        return _scene.in_pick_filter(x, y)
+
+    def _allowed_class(self, cls: str) -> bool:
+        """True when the detector class is enabled in vision.detection_classes."""
+        allowed = _scene.VISION.get('detection_classes') or (
+            'red_cube', 'blue_cylinder')
+        return cls in allowed
 
     def _object_reachable(self, x: float, y: float) -> bool:
         """
@@ -232,12 +287,16 @@ class SortingController(PickAndPlace):
     def _update_registry(self, detections: list) -> list:
         """
         Matches fresh detections to already-tracked objects (within
-        MATCH_RADIUS_M), refreshes their positions, registers new objects,
-        and returns the sortable candidates — nearest to the arm first.
+        MATCH_RADIUS_M), refreshes their positions and yaw, registers new
+        objects, and returns the sortable candidates — nearest to the arm first.
         Candidates must be: on the pick table, reachable, not done and not
         blacklisted.
+
+        detections: list of (cls, x, y, angle_deg) from _collect/_scan_pass.
         """
-        for (cls, x, y) in detections:
+        for det in detections:
+            cls, x, y = det[0], det[1], det[2]
+            angle_deg = det[3] if len(det) > 3 else 0.0
             if not self._on_pick_table(x, y):
                 continue  # e.g. objects already placed on Table 1
             best, best_d = None, MATCH_RADIUS_M
@@ -249,6 +308,7 @@ class SortingController(PickAndPlace):
                     best, best_d = e, d
             if best is not None:
                 best['x'], best['y'] = x, y        # refresh tracked position
+                best['angle_deg'] = angle_deg       # refresh yaw from latest scan
                 continue
             if not self._object_reachable(x, y):
                 self.get_logger().warning(
@@ -256,7 +316,7 @@ class SortingController(PickAndPlace):
                 )
                 continue
             self._registry.append({
-                'cls': cls, 'x': x, 'y': y,
+                'cls': cls, 'x': x, 'y': y, 'angle_deg': angle_deg,
                 'attempts': 0, 'done': False, 'blacklisted': False,
             })
 
@@ -284,6 +344,52 @@ class SortingController(PickAndPlace):
     def _slot_index(self, cls: str) -> int:
         return self._red_used if cls == 'red_cube' else self._blue_used
 
+    # ── Wrist-camera multi-pose scan (look-then-move) ─────────────────────
+    def _scan_pass(self) -> list:
+        """
+        Park the TCP directly over each scan pose and collect detections with
+        the eye-in-hand camera.  Because the camera looks straight down the
+        tool axis, the image footprint is centred under the TCP — parking is
+        all the aiming the scan needs.
+
+        Per pose: settle (SCAN_SETTLE_SECS), then _collect() spins for
+        DETECTION_COLLECT_SECS while the arm is stationary, so every
+        back-projected sample uses a frozen TF (look-then-move; the stale
+        motion frames queued before the settle are discarded by _collect's
+        buffer clear).  Returns one deduplicated detection list with
+        cross-pose duplicates merged (same class within DEDUP_RADIUS_M).
+        """
+        merged: list = []
+        scan_az = _arm_z(SCAN_TCP_WORLD_Z)
+        for sy in SCAN_YS:
+            q = self._compute_ik(SCAN_X, sy, scan_az)
+            if q is None:
+                self.get_logger().warning(
+                    f'[scan] pose ({SCAN_X}, {sy}, {scan_az:.3f}) unreachable '
+                    f'— skipped (spawn band partially uncovered)'
+                )
+                continue
+            if not self.move_to_joints(q):
+                self.get_logger().warning(
+                    f'[scan] move to ({SCAN_X}, {sy}) FAILED — partial scan'
+                )
+                continue
+            time.sleep(SCAN_SETTLE_SECS)
+            merged.extend(self._collect())
+
+        # Cross-pose merge: an object in the overlap strip is reported by
+        # both poses; keep the first representative within DEDUP_RADIUS_M.
+        unique: list = []
+        for det in merged:
+            cls, x, y = det[0], det[1], det[2]
+            angle_deg = det[3] if len(det) > 3 else 0.0
+            if not any(
+                c == cls and math.hypot(x - ux, y - uy) < DEDUP_RADIUS_M
+                for (c, ux, uy, *_) in unique
+            ):
+                unique.append((cls, x, y, angle_deg))
+        return unique
+
 
     # ── Grasp verification helpers ───────────────────────────────────
     def _prong_states(self):
@@ -306,8 +412,15 @@ class SortingController(PickAndPlace):
         return 0.035 + qr - ql   # 0.035 m rest gap + symmetric travel
 
     def _verify_grasp(self, label):
-        """True when the jaws stalled on an object after closing."""
-        time.sleep(GRASP_SETTLE_SECS)
+        """True when the jaws stalled on an object after closing.
+
+        Verifies IN PLACE: the arm stays exactly where the close finished
+        (descended on the object) while the prong positions settle, then
+        the measured jaw gap is gated (E2 — no motion is commanded here;
+        the pre-E2 version needlessly re-drove to the grasp joints first).
+        """
+        _ = label  # kept for log context at the call site
+        time.sleep(GRASP_SETTLE_SECS)   # let prong positions settle (no motion)
         gap = self._jaw_gap()
         qr, ql, vr, vl = self._prong_states()
         if gap is None:
@@ -321,12 +434,95 @@ class SortingController(PickAndPlace):
             f'(qr={qr:+.4f}, ql={ql:+.4f}) -> {"HELD" if held else "EMPTY"}'
         )
         return held
+
+    # ── Jaw yaw alignment (§5.2, Finding C) ──────────────────────────────
+    @staticmethod
+    def _jaw_world_yaw(theta1: float) -> float:
+        """
+        Compute the jaw's current yaw in the world frame from the base joint
+        angle θ1 (radians).
+
+        On the UR5e (Phase 0 baseline) the jaw travel axis is the gripper
+        base's Y axis.  FK-verified against the vendor URDF: with wrist_3
+        (q6) zero the jaw axis sits exactly θ1 from world +X, and for any
+        q6 the relation is jaw_yaw = degrees(θ1 - q6) while the tool z-axis
+        stays (0, 0, -1) — so q6 is a pure yaw trim at tool-down poses.
+
+        Returned in degrees (consistent with minAreaRect convention).
+        """
+        return math.degrees(theta1)
+
+    @staticmethod
+    def _nearest_90_deg(angle_deg: float) -> float:
+        """Round angle to the nearest multiple of 90°, result in [0, 360)."""
+        return round(angle_deg / 90.0) * 90.0
+
+    def _align_ik_yaw(self, q: list, obj_angle_deg: float,
+                      class_id: str, label: str) -> list:
+        """
+        Apply yaw alignment to an IK joint solution by adding a wrist-roll
+        correction Δθ5 (joint index 4 in the 6-DOF list) so the jaw faces
+        align with the nearest cube face (§5.2, Finding C).
+
+        Cylinders are insensitive to yaw → returned unchanged.
+        The correction is clamped to the ±3.14 rad joint limit.
+        TCP position is unchanged (verified: 0.00 mm shift at all sampled poses).
+
+        q         : 6-DOF joint list from _compute_ik
+        obj_angle : minAreaRect angle in degrees (0° = camera col, measured CW)
+        class_id  : 'red_cube' or 'blue_cylinder'
+        """
+        if class_id != 'red_cube':
+            return q   # cylinder: any yaw is valid
+        if q is None:
+            return q
+
+        jaw_yaw = self._jaw_world_yaw(q[0])           # world yaw of the jaw axis
+        # Object angle from minAreaRect: 0° = first axis of the enclosing rect.
+        # Nearest face normal for a cube is at the nearest 90° from the jaw yaw.
+        nearest = self._nearest_90_deg(obj_angle_deg)
+        delta_deg = nearest - jaw_yaw
+        # Normalise to (-180, 180]
+        delta_deg = (delta_deg + 180.0) % 360.0 - 180.0
+        delta_rad = math.radians(delta_deg)
+
+        new_q = list(q)
+        # jaw_yaw = degrees(θ1 - θ6) on the UR5e (tool-down, FK-verified), so
+        # rotating the jaw axis by +delta means trimming wrist_3 by -delta.
+        new_q[5] = self._normalize_angle(q[5] - delta_rad)
+        if abs(new_q[5]) > self.JOINT_LIMIT:
+            # Try ±90° neighbours (the cube has 4-fold symmetry)
+            for alt in (delta_rad + math.pi / 2, delta_rad - math.pi / 2,
+                        delta_rad + math.pi):
+                candidate = self._normalize_angle(q[5] - alt)
+                if abs(candidate) <= self.JOINT_LIMIT:
+                    new_q[5] = candidate
+                    break
+            else:
+                self.get_logger().warning(
+                    f'  [{label}] yaw alignment Δθ6={math.degrees(delta_rad):.1f}° '
+                    'out of range — picking without yaw correction'
+                )
+                return q
+
+        self.get_logger().info(
+            f'  [{label}] yaw alignment: jaw={jaw_yaw:.1f}°  '
+            f'obj={obj_angle_deg:.1f}°  nearest={nearest:.1f}°  '
+            f'Δ={delta_deg:.1f}°  θ6: {math.degrees(q[5]):.1f}° → {math.degrees(new_q[5]):.1f}°'
+        )
+        return new_q
+
     # ── Single pick-place cycle (no home visit, no drop mid-swing) ────────
     def _pick_and_place(self, entry: dict, zone_x: float, zone_y: float,
                         label: str) -> bool:
         """
         Pick the tracked object `entry` and place it at (zone_x, zone_y).
         Sequence: pre-pick → grasp → lift → traverse → place → retreat.
+
+        Yaw alignment (§5.2): before each IK call θ5 is adjusted to align
+        the jaw faces with the nearest cube face normal derived from the
+        object's minAreaRect angle stored in `entry['angle_deg']`.  The
+        TCP position is unchanged (Finding C: 0.00 mm shift).
 
         The lift leg breaks the long grasp→place move into two short legs, so
         MoveIt plans a direct high swing and can no longer fold the arm back
@@ -335,6 +531,8 @@ class SortingController(PickAndPlace):
         Returns True on success.
         """
         ox, oy = entry['x'], entry['y']
+        obj_angle = entry.get('angle_deg', 0.0)
+        cls       = entry['cls']
         pick_az      = _arm_z(PICK_WORLD_Z)           # 0.05
         pre_pick_az  = pick_az + LIFT_HEIGHT_M        # 0.15
         place_az     = _arm_z(self._place_wz)         # 0.10
@@ -342,19 +540,24 @@ class SortingController(PickAndPlace):
 
         self.get_logger().info(
             f'[{label}] pick=({ox:.3f},{oy:.3f}) arm_pick_z={pick_az:.3f}  '
-            f'→ zone=({zone_x:.3f},{zone_y:.3f}) arm_place_z={place_az:.3f}'
+            f'→ zone=({zone_x:.3f},{zone_y:.3f}) arm_place_z={place_az:.3f}  '
+            f'obj_angle={obj_angle:.1f}°'
         )
 
         # 1. Open gripper
         self.move_gripper(GRIPPER_OPEN)
 
-        # 2. Pre-pick: 10 cm above the object
-        if not self.move_to_joints(self._compute_ik(ox, oy, pre_pick_az)):
+        # 2. Pre-pick: 10 cm above the object, with jaw yaw aligned
+        q_pre = self._compute_ik(ox, oy, pre_pick_az)
+        q_pre = self._align_ik_yaw(q_pre, obj_angle, cls, label)
+        if not self.move_to_joints(q_pre):
             self.get_logger().error(f'  [{label}] Pre-pick FAILED')
             return False                              # object untouched
 
-        # 3. Descend to grasp height
-        if not self.move_to_joints(self._compute_ik(ox, oy, pick_az)):
+        # 3. Descend to grasp height (same yaw alignment as pre-pick)
+        q_grasp = self._compute_ik(ox, oy, pick_az)
+        q_grasp = self._align_ik_yaw(q_grasp, obj_angle, cls, label)
+        if not self.move_to_joints(q_grasp):
             self.get_logger().error(f'  [{label}] Grasp descent FAILED')
             return False                              # still at safe height
 
@@ -469,7 +672,9 @@ class SortingController(PickAndPlace):
         motion_fail_streak = 0   # consecutive failed cycles (circuit breaker)
         while empty_scans < EMPTY_SCANS_TO_FINISH:
             scan_no += 1
-            detections = self._collect()
+            # Wrist-camera scan: park over each pose, collect while settled,
+            # merge across poses, then update the tracked-object registry.
+            detections = self._scan_pass()
             candidates = self._update_registry(detections)
 
             self.get_logger().info(

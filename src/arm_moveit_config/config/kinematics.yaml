@@ -1,12 +1,12 @@
 arm:
+  # KDL + position-only IK — matches the upstream ur_moveit_config defaults
+  # (Phase 0 §0.2); the closed-form 6R UR5e solver replaces this in
+  # Phase 1 §1.2.  Orientation is enforced by the tool-down joint convention
+  # of the interim IK in pick_and_place.py (q5 = pi/2, q6 = 0).
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
   kinematics_solver_timeout: 1.0
   kinematics_solver_attempts: 10
-  # position_only_ik lets KDL find solutions for just (x,y,z).
-  # The original compute_ik() that was replaced never constrained orientation either.
-  # Once the arm is moving, the correct "pointing down" quaternion can be read from
-  # RViz and set as the default in move_to_pose().
   position_only_ik: True
 
 # Gripper is an end-effector group with prismatic joints only — no IK solver needed
